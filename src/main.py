@@ -10,7 +10,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from asyncio import sleep
 from dotenv import load_dotenv 
 from datetime import datetime
-from typing import TypeVar
 
 load_dotenv('.env')
 DATA_SUPPLIER_SERVER = os.getenv('PATH_TO_DATA_FOLDER')
@@ -31,8 +30,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-T = TypeVar("T")
-
 ais_state = {
     "data": None,
     "last_updated_hour": None
@@ -45,7 +42,7 @@ async def update_ais_state():
     ais_state["last_updated_hour"] = current_hour
     ais_state["data"] = pd.read_feather(DATA_FILE_PATH+'aisdk-2024-09-09-hour-' + str(current_hour) + '.feather')
     ais_state["data"]["Time"] = ais_state["data"]["# Timestamp"].dt.time.astype(str)
-    logger.info("Updated ais state")
+    logger.info(f"Updated ais state. ({datetime.now().replace(microsecond=0)})")
 
 async def ais_state_updater():
     while True:
@@ -112,15 +109,28 @@ async def ais_data_fetch():
 async def location_slice(latitude_range: str, longitude_range: str):
     latitude_range = latitude_range.split(",")
     longitude_range = longitude_range.split(",")
+
+    if len(latitude_range) != 2:
+        raise HTTPException(status_code=400, detail=f"Latitude range expected 2 arguments (min,max) got: {len(latitude_range)}")
+
+    if len(longitude_range) != 2:
+        raise HTTPException(status_code=400, detail=f"Longitude range expected 2 arguments (min,max) got: {len(longitude_range)}")
+
     try:
-        lat_start = float(latitude_range[0])
-        lat_end = float(latitude_range[1])
-        long_start = float(longitude_range[0])
-        long_end = float(longitude_range[1])
+        lat_min = float(latitude_range[0])
+        lat_max = float(latitude_range[1])
+        long_min = float(longitude_range[0])
+        long_max = float(longitude_range[1])
     except:
         raise HTTPException(status_code=400, detail="Latitude and Longitude must be numbers")
     
-    generator = ais_lat_long_slice_generator((lat_start, lat_end), (long_start, long_end))
+    if lat_min > lat_max:
+        raise HTTPException(status_code=400, detail=f"Expected first argument to be smaller than second argument, got: latitude_min: {lat_min}, latitude_max: {lat_max}")
+
+    if long_min > long_max:
+        raise HTTPException(status_code=400, detail=f"Expected first argument to be smaller than second argument, got: longitude_min: {long_min}, longitude_max: {long_max}")
+
+    generator = ais_lat_long_slice_generator((lat_min, lat_max), (long_min, long_max))
 
     return StreamingResponse(generator, media_type="text/event-stream")
 
