@@ -115,18 +115,18 @@ async def ais_data_generator():
 
 async def dummy_prediction_generator():
     while True:
-        data: pd.DataFrame = await get_current_ais_data()
+        data: pd.DataFrame = ais_state["data"]
         current_time = datetime.now()
-        time_delta = current_time + timedelta(minutes=30)
+        time_delta = current_time + timedelta(minutes=10)
 
         current_time = current_time.time().strftime("%H:%M:%S")
         time_delta = time_delta.time().strftime("%H:%M:%S")
 
-        data = data[(data["Time"]>= current_time) & 
+        data = data[(data["Time"] >= current_time) & 
                     (data["Time"] <= time_delta)]
         data = data.to_json(orient="records")
         yield 'event: ais\n' + 'data: ' + data + '\n\n'
-        await sleep(1)
+        await sleep(60)
 
 async def get_current_ais_data():
     current_time = datetime.now().time().strftime("%H:%M:%S")
