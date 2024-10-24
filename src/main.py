@@ -1,15 +1,16 @@
 import asyncio
 import os
+import numpy as np
 import uvicorn
 import pandas as pd
 import logging
-from fastapi import BackgroundTasks, FastAPI, Response, Depends, HTTPException, Query, Request
+from fastapi import FastAPI
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from asyncio import sleep
-from dotenv import load_dotenv, find_dotenv
-from datetime import datetime
-from typing import Any, Awaitable, TypeVar
+from dotenv import load_dotenv 
+from datetime import datetime, timedelta
+from helpers import slice_query_validation
 
 load_dotenv('.env')
 DATA_SUPPLIER_SERVER = os.getenv('PATH_TO_DATA_FOLDER')
@@ -30,28 +31,70 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-T = TypeVar("T")
-
 ais_state = {
     "data": None,
     "last_updated_hour": None
 }
+
+vessel_data = {}
+
+trajectories = []
+
+vessel_records_threshold = 10
 
 async def update_ais_state():
     current_hour = datetime.now().hour
     ais_state["last_updated_hour"] = current_hour
     ais_state["data"] = pd.read_feather(DATA_FILE_PATH+'aisdk-2024-09-09-hour-' + str(current_hour) + '.feather')
     ais_state["data"]["Time"] = ais_state["data"]["# Timestamp"].dt.time.astype(str)
-    logger.info("Updated ais state")
+    logger.info(f"Updated ais state. ({datetime.now().replace(microsecond=0)})")
 
 async def ais_state_updater():
     while True:
         if ais_state["last_updated_hour"] != datetime.now().hour or ais_state["data"] is None:
             await update_ais_state()
-        await asyncio.sleep(60)
+        await asyncio.sleep(0)
+
+async def filter_ais_data(data: pd.DataFrame):
+    data = data.rename(lambda x:x.lower(), axis="columns")
+    data = data.drop(columns="time")
+    data = data.loc[data["navigational status"] != "Moored"]
+    data = data.loc[data["type of mobile"] != "Base Station"]
+    data = data.loc[data["sog"] != 0]
+    data = data.loc[data["sog"] <= 50]
+    data = data.drop_duplicates(subset=["# timestamp", "mmsi"])
+    data = data.dropna(subset=["longitude", "latitude", "sog", "cog"])
+    data = data.replace([np.inf, -np.inf, np.nan], None)
+
+    return data
+
+async def preprocess_ais():
+    while True:
+        data: pd.DataFrame = await get_current_ais_data()
+        if data.empty:
+            logger.warning("There was no ais data for current time")
+            await sleep(0)
+            continue
+
+        filtered_data = await filter_ais_data(data)
+
+        grouped_data = filtered_data.groupby("mmsi")
+
+        for name, group in grouped_data:
+            if name in vessel_data:
+                vessel_data[name].extend(group.to_dict(orient="records"))
+            else:
+                vessel_data[name] = group.to_dict(orient="records")
+
+            if len(vessel_data[name]) >= vessel_records_threshold:
+                trajectories.append(vessel_data[name]) 
+                vessel_data[name] = []  
+
+        await sleep(1)
 
 async def startup():
     asyncio.create_task(ais_state_updater())
+    asyncio.create_task(preprocess_ais())
 
 app.add_event_handler("startup", startup)
 
@@ -70,28 +113,44 @@ async def ais_data_generator():
         yield 'event: ais\n' + 'data: ' + data + '\n\n'
         await sleep(1)
 
+async def dummy_prediction_generator():
+    while True:
+        data: pd.DataFrame = await get_current_ais_data()
+        current_time = datetime.now()
+        time_delta = current_time + timedelta(minutes=30)
+
+        current_time = current_time.time().strftime("%H:%M:%S")
+        time_delta = time_delta.time().strftime("%H:%M:%S")
+
+        data = data[(data["Time"]>= current_time) & 
+                    (data["Time"] <= time_delta)]
+        data = data.to_json(orient="records")
+        yield 'event: ais\n' + 'data: ' + data + '\n\n'
+        await sleep(1)
+
 async def get_current_ais_data():
     current_time = datetime.now().time().strftime("%H:%M:%S")
+    # TODO: Current time skips a second sometimes
     return ais_state["data"][ais_state["data"]["Time"] == current_time]
 
 @app.get("/dummy-ais-data")
-async def ais_data_fetch(request: Request):
+async def ais_data_fetch():
     generator = ais_data_generator()
     return StreamingResponse(generator, media_type="text/event-stream")
 
+@app.get("/dummy-prediction")
+async def prediction_fetch():
+    generator = dummy_prediction_generator()
+    return StreamingResponse(generator, media_type="text/event-stream")
+
 @app.get("/slice")
-async def location_slice(latitude_range: str, longitude_range: str):
-    latitude_range = latitude_range.split(",")
-    longitude_range = longitude_range.split(",")
-    try:
-        lat_start = float(latitude_range[0])
-        lat_end = float(latitude_range[1])
-        long_start = float(longitude_range[0])
-        long_end = float(longitude_range[1])
-    except:
-        raise HTTPException(status_code=400, detail="Latitude and Longitude must be numbers")
-    
-    generator = ais_lat_long_slice_generator((lat_start, lat_end), (long_start, long_end))
+async def location_slice(latitude_range: str | None = None, longitude_range: str | None = None):
+
+    if latitude_range is None and longitude_range is None:
+        generator = ais_data_generator()
+    else:
+        lat_range, long_range = slice_query_validation(latitude_range, longitude_range)
+        generator = ais_lat_long_slice_generator(lat_range, long_range)
 
     return StreamingResponse(generator, media_type="text/event-stream")
 
