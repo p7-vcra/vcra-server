@@ -9,7 +9,7 @@ from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from asyncio import sleep
 from dotenv import load_dotenv 
-from datetime import datetime, timedelta
+from datetime import datetime 
 from helpers import slice_query_validation
 
 load_dotenv('.env')
@@ -46,7 +46,6 @@ async def update_ais_state():
     current_hour = datetime.now().hour
     ais_state["last_updated_hour"] = current_hour
     ais_state["data"] = pd.read_feather(DATA_FILE_PATH+'aisdk-2024-09-09-hour-' + str(current_hour) + '.feather')
-    ais_state["data"]["Time"] = ais_state["data"]["# Timestamp"].dt.time.astype(str)
     logger.info(f"Updated ais state. ({datetime.now().replace(microsecond=0)})")
 
 async def ais_state_updater():
@@ -57,7 +56,6 @@ async def ais_state_updater():
 
 async def filter_ais_data(data: pd.DataFrame):
     data = data.rename(lambda x:x.lower(), axis="columns")
-    data = data.drop(columns="time")
     data = data.loc[data["navigational status"] != "Moored"]
     data = data.loc[data["type of mobile"] != "Base Station"]
     data = data.loc[data["sog"] != 0]
@@ -102,36 +100,36 @@ async def ais_lat_long_slice_generator(latitude_range: tuple, longitude_range: t
     while True:  
         data: pd.DataFrame = await get_current_ais_data()
         data = data[data["Latitude"].between(latitude_range[0], latitude_range[1]) & data["Longitude"].between(longitude_range[0], longitude_range[1])]
-        data = data.to_json(orient="records")
+        data = data.to_json(orient="records", date_format="iso")
         yield 'event: ais\n' + 'data: ' + data + '\n\n'
         await sleep(1)
         
 async def ais_data_generator():
     while True: 
         data: pd.DataFrame = await get_current_ais_data()
-        data = data.to_json(orient='records')
+        data = data.to_json(orient='records', date_format="iso")
         yield 'event: ais\n' + 'data: ' + data + '\n\n'
         await sleep(1)
 
 async def dummy_prediction_generator():
     while True:
         data: pd.DataFrame = ais_state["data"]
-        current_time = datetime.now()
-        time_delta = current_time + timedelta(minutes=10)
+        current_time = pd.Timestamp.now()
+        time_delta = (current_time + pd.Timedelta(minutes=10)).time().replace(microsecond=0)
+        timestamp = data["# Timestamp"].dt.time
 
-        current_time = current_time.time().strftime("%H:%M:%S")
-        time_delta = time_delta.time().strftime("%H:%M:%S")
-
-        data = data[(data["Time"] >= current_time) & 
-                    (data["Time"] <= time_delta)]
-        data = data.to_json(orient="records")
+        data = data[(timestamp >= current_time.time()) & 
+                    (timestamp <= time_delta)]
+        data = data.to_json(orient="records", date_format="iso")
         yield 'event: ais\n' + 'data: ' + data + '\n\n'
         await sleep(60)
 
 async def get_current_ais_data():
-    current_time = datetime.now().time().strftime("%H:%M:%S")
-    # TODO: Current time skips a second sometimes
-    return ais_state["data"][ais_state["data"]["Time"] == current_time]
+    current_time = pd.Timestamp.now().time().replace(microsecond=0)
+    timestamp = ais_state["data"]["# Timestamp"].dt.time
+    result = ais_state["data"][timestamp == current_time]
+
+    return result
 
 @app.get("/dummy-ais-data")
 async def ais_data_fetch():
