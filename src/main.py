@@ -4,6 +4,7 @@ import numpy as np
 import uvicorn
 import pandas as pd
 import logging
+import aiohttp
 from fastapi import FastAPI
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -18,6 +19,8 @@ DATA_FILE_PATH = str(os.getenv('PATH_TO_DATA_FOLDER'))
 WORKERS = int(os.getenv('WORKERS'))
 SOURCE_IP = os.getenv('SOURCE_IP')
 SOURCE_PORT = int(os.getenv('SOURCE_PORT'))
+PREDICTION_SERVER_URL = os.getenv('PREDICTION_SERVER_URL')
+
 
 logger = logging.getLogger('uvicorn.error')
 
@@ -39,6 +42,8 @@ ais_state = {
 vessel_data = {}
 
 trajectories = []
+
+predictions = []
 
 vessel_records_threshold = 10
 
@@ -92,9 +97,30 @@ async def preprocess_ais():
 
         await sleep(1)
 
+async def get_ais_prediction():
+    while True:
+        if len(trajectories) == 0:
+            await sleep(0)
+            continue
+
+        trajectory = trajectories.pop(0)
+        print(trajectory)
+        # prediction = post_to_prediction_server(trajectory)
+        # predictions.append(prediction)
+
+async def post_to_prediction_server(trajectory):
+    async with aiohttp.ClientSession() as session:
+        async with session.post(PREDICTION_SERVER_URL, json=trajectory) as response:
+            if response.status == 200:
+                logger.info(f"Data for posted successfully.")
+                return response
+            else:
+                logger.warning(f"Failed to post data: {response.status}")
+
 async def startup():
     asyncio.create_task(ais_state_updater())
     asyncio.create_task(preprocess_ais())
+    asyncio.create_task(get_ais_prediction())
 
 app.add_event_handler("startup", startup)
 
