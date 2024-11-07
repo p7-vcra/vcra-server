@@ -39,7 +39,7 @@ async def json_encode_iso(data: pd.DataFrame):
 async def timestamp_to_unix(timestamp: pd.DataFrame):
     return (timestamp - pd.Timestamp("1970-01-01")) // pd.Timedelta("1s")
 
-async def wgs84_to_utm(lons, lats):
+async def wgs84_to_utm(lons, lats, inverse=False):
     
     utm_xs = []
     utm_ys = []
@@ -52,7 +52,7 @@ async def wgs84_to_utm(lons, lats):
         proj_string = f"+proj=utm +zone={utm_zone} +ellps=WGS84 +datum=WGS84 +units=m +no_defs"
         myProj = pyproj.Proj(proj_string)
         
-        utm_x, utm_y = myProj(lon, lat)
+        utm_x, utm_y = myProj(lon, lat, inverse=inverse)
 
         utm_xs.append(utm_x)
         utm_ys.append(utm_y)
