@@ -45,7 +45,7 @@ ais_state = {
 
 vessel_data = {}
 
-trajectories = []
+trajectory_queue = asyncio.Queue()
 
 predictions = {}
 
@@ -119,7 +119,7 @@ async def preprocess_ais():
 
                 # The first row has no previous row to calculate delta, so we get NaN
                 vessel_data[name].dropna(subset=["dt", "dutm_x", "dutm_y"], inplace=True)
-                trajectories.append(vessel_data[name].to_dict(orient="records")) 
+                await trajectory_queue.put(vessel_data[name].to_dict(orient="records")) 
                 vessel_data[name] = pd.DataFrame()
 
         prev_timestamp = curr_timestamp
@@ -128,11 +128,11 @@ async def preprocess_ais():
 async def get_ais_prediction():
     async with aiohttp.ClientSession() as session:
         while True:
-            if len(trajectories) == 0:
+            if trajectory_queue.empty():
                 await sleep(0)
                 continue
 
-            trajectory = pd.DataFrame(trajectories.pop(0))
+            trajectory = pd.DataFrame(await trajectory_queue.get())
             mmsi = str(trajectory["mmsi"][0])
             trajectory = trajectory[["dt", "dutm_x", "dutm_y"]]
             data = {"data": [trajectory.values.tolist()]}
