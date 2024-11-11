@@ -25,7 +25,6 @@ SOURCE_PORT = int(os.getenv('SOURCE_PORT', '8000'))
 PREDICTION_SERVER_IP = os.getenv('PREDICTION_SERVER_IP')
 PREDICTION_SERVER_PORT = os.getenv('PREDICTION_SERVER_PORT')
 
-
 logger = logging.getLogger('uvicorn.error')
 
 app = FastAPI()
@@ -39,7 +38,7 @@ app.add_middleware(
 )
 
 ais_state = {
-    "data": None,
+    "data": pd.DataFrame(),
     "last_updated_hour": 0
 }
 
@@ -62,7 +61,10 @@ async def update_ais_state():
 async def ais_state_updater():
     while True:
         if ais_state["last_updated_hour"] != datetime.now().hour or ais_state["data"] is None:
-            await update_ais_state()
+            try:
+                await update_ais_state()
+            except Exception as e:
+                logger.error(e)
         await sleep(0)
 
 async def filter_ais_data(data: pd.DataFrame):
@@ -206,6 +208,10 @@ async def get_current_ais_data():
     current_time = pd.Timestamp.now().time().replace(microsecond=0)
     timestamp = ais_state["data"]["timestamp"].dt.time
     result = ais_state["data"][timestamp == current_time]
+
+    if timestamp != current_time:
+        logger.warning(f"Current time: {current_time} \n AIS Timestamp: {timestamp}")
+        logger.warning(f"AIS state: {ais_state["data"]}")
 
     return result, current_time
 
