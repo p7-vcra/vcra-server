@@ -51,7 +51,7 @@ trajectory_queue = asyncio.Queue()
 
 predictions = {}
 
-vessel_records_threshold = 900
+vessel_records_threshold = 32
 
 async def update_ais_state():
     current_hour = datetime.now().hour
@@ -139,7 +139,7 @@ async def get_ais_prediction():
     async with aiohttp.ClientSession() as session:
         while True:
             if trajectory_queue.empty():
-                await sleep(1)
+                await sleep(0)
                 continue
 
             trajectory = await trajectory_queue.get()
@@ -186,7 +186,8 @@ def normalize_inputs(df, norm_params):
 
 async def post_process_prediction(prediction: list, trajectory: pd.DataFrame, norm_param):
     look_ahead_points = 32
-    features_outputs = [(x % (y)) for x in ["dutm_x(t+%d)", "dutm_y(t+%d)"] for y in range(1, look_ahead_points+1)]
+    features_outputs = [f"dutm_x(t+{i})" for i in range(1, look_ahead_points + 1)] + \
+                       [f"dutm_y(t+{i})" for i in range(1, look_ahead_points + 1)]
 
     normalized = pd.DataFrame(prediction[0], columns=features_outputs)
 
@@ -202,15 +203,16 @@ async def post_process_prediction(prediction: list, trajectory: pd.DataFrame, no
 
     # convert to actual values
     for la in range(1, look_ahead_points + 1):
-        denormalized[f"utm_x(t+{la})"] = denormalized[f"dlon(t+{la})"] + trajectory["dutm_x"].iloc[0]
-        denormalized[f"utm_y(t+{la})"] = denormalized[f"dlat(t+{la})"] + trajectory["dutm_y"].iloc[0]
-        denormalized = denormalized.copy() 
+        denormalized[f"utm_x(t+{la})"] = denormalized[f"dutm_x(t+{la})"] + trajectory["utm_x"].iloc[-1]
+        denormalized[f"utm_y(t+{la})"] = denormalized[f"dutm_y(t+{la})"] + trajectory["utm_y"].iloc[-1]
+        denormalized = denormalized.copy()
 
     logger.debug(f"Prediction after conversion from delta values: \n {denormalized[['utm_x(t+1)', 'utm_x(t+2)', 'utm_y(t+1)', 'utm_y(t+2)']].head(4)}")
 
     # convert from utm to wgs84
     results = {}
     utm_columns = [(f"utm_x(t+{i})", f"utm_y(t+{i})") for i in range(1, look_ahead_points + 1)]
+
     for lon_col, lat_col in utm_columns:
         wgs_lon_col = lon_col.replace("utm_x", "lon")
         wgs_lat_col = lat_col.replace("utm_y", "lat")
@@ -220,6 +222,8 @@ async def post_process_prediction(prediction: list, trajectory: pd.DataFrame, no
     df_results = pd.concat([denormalized, pd.DataFrame(results)], axis=1)
     
     logger.debug(f"Prediction after conversion to WGS84: \n {df_results[['lon(t+1)', 'lon(t+2)', 'lat(t+1)', 'lat(t+2)']].head(4)}")
+
+    return df_results
 
 async def post_to_prediction_server(trajectory: dict, client_session: aiohttp.ClientSession):
     prediction_server_url = f"http://{PREDICTION_SERVER_IP}:{PREDICTION_SERVER_PORT}/predict"
@@ -271,10 +275,12 @@ async def dummy_prediction_generator():
 
 async def predictions_generator():
     while True:
-        data = pd.DataFrame(predictions)
-        data = await json_encode_iso(data)
+        data = "Empty"
+        if predictions:
+            data = pd.concat(predictions.values())
+            data = await json_encode_iso(data)
         yield 'event: ais\n' + 'data: ' + data + '\n\n'
-        await sleep(1)
+        await sleep(60)
 
 async def get_current_ais_data():
     current_time = pd.Timestamp.now().time().replace(microsecond=0)
@@ -321,4 +327,4 @@ if __name__ == "__main__":
     if args.debug:
         LOG_LEVEL = logging.DEBUG
 
-    uvicorn.run("main:app", host=SOURCE_IP, port=SOURCE_PORT, reload=True, log_level=LOG_LEVEL)
+    uvicorn.run("main:app", host=SOURCE_IP, port=SOURCE_PORT, reload=True, log_level=LOG_LEVEL, workers=WORKERS, access_log=True)
