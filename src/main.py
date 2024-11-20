@@ -154,4 +154,4 @@ async def location_slice(latitude_range: str | None = None, longitude_range: str
     return StreamingResponse(generator, media_type="text/event-stream")
 
 if __name__ == "__main__":
-    uvicorn.run("main:app", host=SOURCE_IP, port=SOURCE_PORT, reload=True)
+    uvicorn.run("main:app", host=SOURCE_IP, port=SOURCE_PORT, reload=False, workers=WORKERS)
