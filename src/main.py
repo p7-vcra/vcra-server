@@ -150,80 +150,24 @@ async def get_ais_prediction():
 
             data = trajectory[["dt", "dutm_x", "dutm_y"]]
 
-            logger.debug(f"Trajectory before normalization: \n {data[['dt', 'dutm_x', 'dutm_y']].head(4)}")
-
-            norm_params = pd.read_json("data/rd9_epoch100_h1n350_ffn150_norm_param_mean_std.json")
-
-            norm_params = norm_params.transpose()
-
-            norm_params.columns = ["d", "dlon", "dlat"]
-
-            # normalize input
-            norm_data = normalize_inputs(data, norm_params)
-
-            logger.debug(f"Normalized trajectory: \n {norm_data.head(4)}")
-
-            request_data = {"data": norm_data.values.reshape(1, norm_data.shape[0], 3).tolist()}
+            encoded_inputs = await json_encode_iso(data)
+         
+            encoded_trajectory = await json_encode_iso(trajectory)
+         
+            request_data = {"data": encoded_inputs, "trajectory": encoded_trajectory}
             
             response = await post_to_prediction_server(request_data, session)
 
             if response:
                 prediction = response["prediction"]
-                prediction = await post_process_prediction(prediction, trajectory, norm_params)
+
+                logger.debug(f"Prediction received: {prediction}")
+
                 predictions[mmsi] = prediction
             else:
                 logger.warning(f"No prediction received for trajectory: {trajectory}")
             
             await sleep(1)
-
-def normalize_inputs(df, norm_params):
-    normalized_df = pd.DataFrame()
-    for feature in norm_params.columns:
-        feature_cols = [col for col in df.columns if col.startswith(feature)]
-        for col in feature_cols:
-            normalized_df[col] = (df[col] - norm_params.loc["sc_x_mean", feature]) / norm_params.loc["sc_x_std", feature]
-    return normalized_df
-
-async def post_process_prediction(prediction: list, trajectory: pd.DataFrame, norm_param):
-    look_ahead_points = 32
-    features_outputs = [f"dutm_x(t+{i})" for i in range(1, look_ahead_points + 1)] + \
-                       [f"dutm_y(t+{i})" for i in range(1, look_ahead_points + 1)]
-
-    normalized = pd.DataFrame(prediction[0], columns=features_outputs)
-
-    # denormalize
-    denormalized = pd.DataFrame()
-    
-    for feature in norm_param.columns:
-        feature_cols = [col for col in normalized.columns if col.startswith(feature)]
-        for col in feature_cols:
-            denormalized[col] = (normalized[col] * norm_param.loc["sc_x_std", feature] + norm_param.loc["sc_x_mean", feature])
-
-    logger.debug(f"Denormalized prediction: \n {denormalized.head(4)}")
-
-    # convert to actual values
-    for la in range(1, look_ahead_points + 1):
-        denormalized[f"utm_x(t+{la})"] = denormalized[f"dutm_x(t+{la})"] + trajectory["utm_x"].iloc[-1]
-        denormalized[f"utm_y(t+{la})"] = denormalized[f"dutm_y(t+{la})"] + trajectory["utm_y"].iloc[-1]
-        denormalized = denormalized.copy()
-
-    logger.debug(f"Prediction after conversion from delta values: \n {denormalized[['utm_x(t+1)', 'utm_x(t+2)', 'utm_y(t+1)', 'utm_y(t+2)']].head(4)}")
-
-    # convert from utm to wgs84
-    results = {}
-    utm_columns = [(f"utm_x(t+{i})", f"utm_y(t+{i})") for i in range(1, look_ahead_points + 1)]
-
-    for lon_col, lat_col in utm_columns:
-        wgs_lon_col = lon_col.replace("utm_x", "lon")
-        wgs_lat_col = lat_col.replace("utm_y", "lat")
-
-        results[wgs_lon_col], results[wgs_lat_col] = zip(*denormalized.apply(lambda row: wgs84_to_utm(row[lon_col], row[lat_col], inverse=True), axis=1))
-
-    df_results = pd.concat([denormalized, pd.DataFrame(results)], axis=1)
-    
-    logger.debug(f"Prediction after conversion to WGS84: \n {df_results[['lon(t+1)', 'lon(t+2)', 'lat(t+1)', 'lat(t+2)']].head(4)}")
-
-    return df_results
 
 async def post_to_prediction_server(trajectory: dict, client_session: aiohttp.ClientSession):
     prediction_server_url = f"http://{PREDICTION_SERVER_IP}:{PREDICTION_SERVER_PORT}/predict"
@@ -275,12 +219,9 @@ async def dummy_prediction_generator():
 
 async def predictions_generator():
     while True:
-        data = "Empty"
-        if predictions:
-            data = pd.concat(predictions.values())
-            data = await json_encode_iso(data)
+        data = json.dumps(predictions)
         yield 'event: ais\n' + 'data: ' + data + '\n\n'
-        await sleep(60)
+        await sleep(1)
 
 async def get_current_ais_data():
     current_time = pd.Timestamp.now().time().replace(microsecond=0)
@@ -327,4 +268,4 @@ if __name__ == "__main__":
     if args.debug:
         LOG_LEVEL = logging.DEBUG
 
-    uvicorn.run("main:app", host=SOURCE_IP, port=SOURCE_PORT, reload=True, log_level=LOG_LEVEL, workers=WORKERS, access_log=True)
+    uvicorn.run("main:app", host=SOURCE_IP, port=SOURCE_PORT, log_level=LOG_LEVEL, workers=WORKERS, access_log=True)
