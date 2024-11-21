@@ -51,7 +51,7 @@ trajectory_queue = asyncio.Queue()
 
 predictions = {}
 
-vessel_records_threshold = 32
+vessel_records_threshold = 10
 
 async def update_ais_state():
     current_hour = datetime.now().hour
@@ -106,12 +106,6 @@ async def preprocess_ais():
 
         filtered_data = await filter_ais_data(df)
 
-        # Convert latitude and longitude to utm coordinates
-        utm_xs, utm_ys = wgs84_to_utm(filtered_data["longitude"].values, filtered_data["latitude"].values)
-        filtered_data["utm_x"] = utm_xs
-        filtered_data["utm_y"] = utm_ys
-        filtered_data["t"] = await timestamp_to_unix(filtered_data["timestamp"])
-
         grouped_data = filtered_data.groupby("mmsi")
 
         for name, group in grouped_data:
@@ -121,13 +115,6 @@ async def preprocess_ais():
                 vessel_data[name] = group
 
             if len(vessel_data[name]) == vessel_records_threshold:
-                dts, dutm_xs, dutm_ys = await calc_dt_dutmx_dutmy(vessel_data[name]["t"], vessel_data[name]["utm_x"], vessel_data[name]["utm_y"])
-                vessel_data[name]["dt"] = dts
-                vessel_data[name]["dutm_x"] = dutm_xs
-                vessel_data[name]["dutm_y"] = dutm_ys
-
-                # The first row has no previous row to calculate delta, so we get NaN
-                vessel_data[name].dropna(subset=["dt", "dutm_x", "dutm_y"], inplace=True)
                 await trajectory_queue.put(vessel_data[name]) 
                 # Clear vessel data for mmsi
                 vessel_data[name] = pd.DataFrame()
@@ -145,16 +132,9 @@ async def get_ais_prediction():
             trajectory = await trajectory_queue.get()
             mmsi = str(trajectory["mmsi"].values[0])
 
-            logger.debug(f"Trajectory: \n {trajectory[['longitude', 'latitude']].head(4)}")
-            logger.debug(f"Trajectory: \n {trajectory[['t', 'utm_x', 'utm_y']].head(4)}")
+            data = trajectory[["timestamp", "longitude", "latitude"]]
 
-            data = trajectory[["dt", "dutm_x", "dutm_y"]]
-
-            encoded_inputs = await json_encode_iso(data)
-         
-            encoded_trajectory = await json_encode_iso(trajectory)
-         
-            request_data = {"data": encoded_inputs, "trajectory": encoded_trajectory}
+            request_data = {"data": await json_encode_iso(data)}
             
             response = await post_to_prediction_server(request_data, session)
 
@@ -268,4 +248,4 @@ if __name__ == "__main__":
     if args.debug:
         LOG_LEVEL = logging.DEBUG
 
-    uvicorn.run("main:app", host=SOURCE_IP, port=SOURCE_PORT, log_level=LOG_LEVEL, workers=WORKERS, access_log=True)
+    uvicorn.run("main:app", host=SOURCE_IP, port=SOURCE_PORT, log_level=LOG_LEVEL, workers=WORKERS)
