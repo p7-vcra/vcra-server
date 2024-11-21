@@ -151,15 +151,15 @@ async def get_ais_prediction():
 
 async def post_to_prediction_server(trajectory: dict, client_session: aiohttp.ClientSession):
     prediction_server_url = f"http://{PREDICTION_SERVER_IP}:{PREDICTION_SERVER_PORT}/predict"
-    async with client_session.post(prediction_server_url, json=trajectory) as response:
-        try:
+    try:
+        async with client_session.post(prediction_server_url, json=trajectory) as response:
             if response.status == 200:
                 return await response.json()
             else:
                 logger.warning(f"Failed to post data to prediction server: {response}")
-        except aiohttp.ClientError as e:
-            logger.error(f"Network error while posting to prediction server: {e}")
-            return None
+    except aiohttp.ClientError as e:
+        logger.error(f"Network error while posting to prediction server: {e}")
+        return None
 
 async def startup():
     asyncio.create_task(ais_state_updater())
