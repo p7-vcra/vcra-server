@@ -1,6 +1,7 @@
 from fastapi import HTTPException
+import pandas as pd
 
-def slice_query_validation(latitude_range: str, longitude_range: str):
+async def slice_query_validation(latitude_range: str, longitude_range: str):
     
     try:
         latitude_range = latitude_range.split(",")
@@ -29,3 +30,6 @@ def slice_query_validation(latitude_range: str, longitude_range: str):
         raise HTTPException(status_code=400, detail=f"Expected first argument to be smaller than second argument, got: longitude_min: {long_min}, longitude_max: {long_max}")
     
     return (lat_min, lat_max), (long_min, long_max)
+
+async def json_encode_iso(data: pd.DataFrame):
+    return data.to_json(orient='records', date_format='iso')
