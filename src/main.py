@@ -123,7 +123,7 @@ async def preprocess_ais():
         await sleep(1)
 
 async def get_ais_prediction():
-    async with aiohttp.ClientSession() as session:
+    async with aiohttp.ClientSession(trust_env=True) as session:
         while True:
             if trajectory_queue.empty():
                 await sleep(0)
