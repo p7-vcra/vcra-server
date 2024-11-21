@@ -192,8 +192,8 @@ async def dummy_prediction_generator():
 
         data = data[(timestamp >= current_time.time()) & 
                     (timestamp <= time_delta)]
-        data = data[["# Timestamp", "MMSI", "Latitude", "Longitude"]]
-        data = json_encode_iso(data) 
+        data = data[["timestamp", "mmsi", "latitude", "longitude"]]
+        data = await json_encode_iso(data) 
         yield 'event: ais\n' + 'data: ' + data + '\n\n'
         await sleep(60)
 
