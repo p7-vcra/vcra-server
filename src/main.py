@@ -197,11 +197,17 @@ async def dummy_prediction_generator():
         yield 'event: ais\n' + 'data: ' + data + '\n\n'
         await sleep(60)
 
-async def predictions_generator():
+async def predictions_generator(mmsi: int | None):
     while True:
-        data = json.dumps(predictions)
+        # data = pd.DataFrame.from_dict(predictions)
+        # data = await json_encode_iso(data)
+        if mmsi:
+            data = json.dumps(predictions.get(str(mmsi)))
+        else:
+            data = json.dumps(predictions)
+        
         yield 'event: ais\n' + 'data: ' + data + '\n\n'
-        await sleep(1)
+        await sleep(10)
 
 async def get_current_ais_data():
     current_time = pd.Timestamp.now().time().replace(microsecond=0)
@@ -236,8 +242,8 @@ async def location_slice(latitude_range: str | None = None, longitude_range: str
     return StreamingResponse(generator, media_type="text/event-stream")
 
 @app.get("/predictions")
-async def prediction_fetch():
-    generator = predictions_generator()
+async def prediction_fetch(mmsi: int | None = None):
+    generator = predictions_generator(mmsi)
     return StreamingResponse(generator, media_type="text/event-stream")
 
 if __name__ == "__main__":
