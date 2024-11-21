@@ -1,7 +1,5 @@
 from fastapi import HTTPException
-import numpy as np
 import pandas as pd
-import pyproj
 
 async def slice_query_validation(latitude_range: str, longitude_range: str):
     
@@ -35,21 +33,3 @@ async def slice_query_validation(latitude_range: str, longitude_range: str):
 
 async def json_encode_iso(data: pd.DataFrame):
     return data.to_json(orient='records', date_format='iso')
-
-async def timestamp_to_unix(timestamp: pd.DataFrame):
-    return (timestamp - pd.Timestamp("1970-01-01")) // pd.Timedelta("1s")
-
-def wgs84_to_utm(lon, lat, inverse=False):
-    
-    # proj_string = f"+proj=utm +zone=32 +ellps=WGS84 +datum=WGS84 +units=m +no_defs"
-    myProj = pyproj.Proj(proj="utm", zone=32, ellps="WGS84", datum="WGS84", units="m", no_defs=True, south=False)
-        
-    result_x, result_y = myProj(lon, lat, inverse=inverse)
-    return result_x, result_y
-
-async def calc_dt_dutmx_dutmy(timestamps, utm_xs, utm_ys):
-    dt = timestamps.diff().values
-    dutm_x = utm_xs.diff().values
-    dutm_y = utm_ys.diff().values
-    
-    return dt, dutm_x, dutm_y

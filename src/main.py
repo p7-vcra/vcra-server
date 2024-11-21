@@ -13,7 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from asyncio import sleep
 from dotenv import load_dotenv 
 from datetime import datetime 
-from helpers import json_encode_iso, wgs84_to_utm, timestamp_to_unix, slice_query_validation, calc_dt_dutmx_dutmy
+from helpers import json_encode_iso, slice_query_validation
 
 
 
