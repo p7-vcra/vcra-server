@@ -24,8 +24,13 @@ jobs:
           # Navigate to the application directory
           cd ${{ secrets.APP_PATH }}
 
-          # Terminate existing screen sockets
-          pkill screen
+          # Identify the screen session by name
+          SCREEN_SESSION_NAME="PES"
+
+          # Check if the screen session exists and terminate it if running
+          if screen -list | grep -q "\.${SCREEN_SESSION_NAME}"; then
+            screen -S "${SCREEN_SESSION_NAME}" -X quit
+          fi
 
           # Ensure no process is using port 8000 (replace 8000 with your port if necessary)
           fuser -k 8000/tcp || echo "No process using port 8000"
@@ -37,10 +42,10 @@ jobs:
           git pull
 
           # Start a new screen session and deploy the app
-          screen -dmS PES
-          screen -S PES -X stuff 'source ${{ secrets.ENV_PATH }}\n'
-          screen -S PES -X stuff 'pip install .\n'
-          screen -S PES -X stuff 'python ${{ secrets.START_SCRIPT_PATH }}\n'
+          screen -dmS "${SCREEN_SESSION_NAME}"
+          screen -S "${SCREEN_SESSION_NAME}" -X stuff 'source ${{ secrets.ENV_PATH }}\n'
+          screen -S "${SCREEN_SESSION_NAME}" -X stuff 'pip install .\n'
+          screen -S "${SCREEN_SESSION_NAME}" -X stuff 'python ${{ secrets.START_SCRIPT_PATH }}\n'
 
           # List screen sessions for verification
           screen -ls
