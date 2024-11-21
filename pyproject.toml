@@ -14,4 +14,5 @@ dependencies = [
     "pyarrow",
     "pandas",
     "python-dotenv",
+    "aiohttp",
 ]
