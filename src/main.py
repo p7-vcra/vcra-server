@@ -145,6 +145,9 @@ async def get_ais_prediction():
 
                 global predictions
                 prediction["mmsi"] = mmsi
+                prediction["timestamp"] = trajectory["timestamp"].values[1:]
+                prediction["lon"] = trajectory["longitude"].values[1:]
+                prediction["lat"] = trajectory["latitude"].values[1:]
 
                 if not predictions.empty:
                     predictions = pd.concat([predictions, prediction])
@@ -207,7 +210,8 @@ async def predictions_generator(mmsi: int | None):
     cols = [f"lon(t+{i})" for i in range(1, 33)] + [f"lat(t+{i})" for i in range(1,33)]
     while True:
         if not predictions.empty:
-            data = predictions[cols + ["mmsi"]]
+            data = predictions[["timestamp"] + ["mmsi"] + ["lon"] + ["lat"] + cols]
+            data = data.drop_duplicates(subset=["mmsi"], keep="last")
             data = await json_encode_iso(data)
         else: 
             data = json.dumps([])
