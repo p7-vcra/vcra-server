@@ -49,7 +49,7 @@ vessel_data = {}
 
 trajectory_queue = asyncio.Queue()
 
-predictions = {}
+predictions = pd.DataFrame()
 
 vessel_records_threshold = 10
 
@@ -139,11 +139,17 @@ async def get_ais_prediction():
             response = await post_to_prediction_server(request_data, session)
 
             if response:
-                prediction = response["prediction"]
+                prediction = pd.DataFrame(response["prediction"])
 
                 logger.debug(f"Prediction received: {prediction}")
 
-                predictions[mmsi] = prediction
+                global predictions
+                prediction["mmsi"] = mmsi
+
+                if not predictions.empty:
+                    predictions = pd.concat([predictions, prediction])
+                else:
+                    predictions = prediction
             else:
                 logger.warning(f"No prediction received for trajectory: {trajectory}")
             
@@ -198,14 +204,14 @@ async def dummy_prediction_generator():
         await sleep(60)
 
 async def predictions_generator(mmsi: int | None):
+    cols = [f"lon(t+{i})" for i in range(1, 33)] + [f"lat(t+{i})" for i in range(1,33)]
     while True:
-        # data = pd.DataFrame.from_dict(predictions)
-        # data = await json_encode_iso(data)
-        if mmsi:
-            data = json.dumps(predictions.get(str(mmsi)))
-        else:
-            data = json.dumps(predictions)
-        
+        if not predictions.empty:
+            data = predictions[cols + ["mmsi"]]
+            data = await json_encode_iso(data)
+        else: 
+            data = json.dumps([])
+
         yield 'event: ais\n' + 'data: ' + data + '\n\n'
         await sleep(10)
 
