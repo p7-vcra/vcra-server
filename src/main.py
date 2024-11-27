@@ -207,13 +207,13 @@ async def dummy_prediction_generator():
         await sleep(60)
 
 async def predictions_generator(mmsi: int | None):
-    cols = [f"lon(t+{i})" for i in range(1, 33)] + [f"lat(t+{i})" for i in range(1,33)]
+    cols = [f"lon(t+{i})" for i in range(1, 33)] + [f"lat(t+{i})" for i in range(1, 33)]
     while True:
         if not predictions.empty:
-            data = predictions[["timestamp"] + ["mmsi"] + ["lon"] + ["lat"] + cols]
-            data = data.drop_duplicates(subset=["mmsi"], keep="last")
+            data = predictions if mmsi is None else predictions[predictions["mmsi"] == str(mmsi)]
+            data = data[["timestamp", "mmsi", "lon", "lat"] + cols].drop_duplicates(subset=["mmsi"], keep="last")
             data = await json_encode_iso(data)
-        else: 
+        else:
             data = json.dumps([])
 
         yield 'event: ais\n' + 'data: ' + data + '\n\n'
