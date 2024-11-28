@@ -103,7 +103,7 @@ async def preprocess_ais():
         if prev_timestamp == curr_timestamp:
             await sleep(1)
             continue
-
+        
         filtered_data = await filter_ais_data(df)
 
         grouped_data = filtered_data.groupby("mmsi")
@@ -114,7 +114,10 @@ async def preprocess_ais():
             else:
                 vessel_data[name] = group
 
-            if len(vessel_data[name]) == vessel_records_threshold:
+            diff = datetime.combine(datetime.today(), curr_timestamp) - datetime.combine(datetime.today(), vessel_data[name]["timestamp"].iloc[0].time())
+            logger.debug(f"Vessel {name} has {len(vessel_data[name])} records. Time difference: {diff}")            
+
+            if diff.total_seconds() >= 900:
                 await trajectory_queue.put(vessel_data[name]) 
                 # Clear vessel data for mmsi
                 vessel_data[name] = pd.DataFrame()
