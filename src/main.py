@@ -15,10 +15,7 @@ from dotenv import load_dotenv
 from datetime import datetime 
 from helpers import json_encode_iso, slice_query_validation, format_event
 
-
-
 load_dotenv('.env')
-DATA_SUPPLIER_SERVER = os.getenv('PATH_TO_DATA_FOLDER')
 DATA_FILE_PATH = os.getenv('PATH_TO_DATA_FOLDER')
 WORKERS = int(os.getenv('WORKERS', '1'))
 SOURCE_IP = os.getenv('SOURCE_IP')
@@ -50,8 +47,6 @@ vessel_data = {}
 trajectory_queue = asyncio.Queue()
 
 predictions = pd.DataFrame()
-
-vessel_records_threshold = 10
 
 async def update_ais_state():
     current_hour = datetime.now().hour
@@ -114,10 +109,18 @@ async def preprocess_ais():
             else:
                 vessel_data[name] = group
 
-            diff = datetime.combine(datetime.today(), curr_timestamp) - datetime.combine(datetime.today(), vessel_data[name]["timestamp"].iloc[0].time())
-            # logger.debug(f"Vessel {name} has {len(vessel_data[name])} records. Time difference: {diff}")            
+            diff = vessel_data[name]["timestamp"].max() - vessel_data[name]["timestamp"].min()
 
-            if diff.total_seconds() >= 900:
+            if diff.total_seconds() >= 120:  
+                vessel_data[name].reset_index(drop=True, inplace=True)
+                vessel_data[name] = vessel_data[name].infer_objects(copy=False)
+                interp_cols = ["longitude", "latitude"]
+                vessel_data[name].loc[0, "timestamp"] = vessel_data[name].loc[0, "timestamp"].floor("min")
+                vessel_data[name] = vessel_data[name].set_index("timestamp")
+                vessel_data[name] = vessel_data[name].resample("1min").asfreq()
+                vessel_data[name][interp_cols] = vessel_data[name][interp_cols].interpolate(method="linear")
+                vessel_data[name] = vessel_data[name].ffill()
+                vessel_data[name].reset_index(inplace=True)
                 await trajectory_queue.put(vessel_data[name]) 
                 # Clear vessel data for mmsi
                 vessel_data[name] = pd.DataFrame()
@@ -126,7 +129,7 @@ async def preprocess_ais():
         await sleep(1)
 
 async def get_ais_prediction():
-    async with aiohttp.ClientSession(trust_env=True) as session:
+    async with aiohttp.ClientSession() as session:
         while True:
             if trajectory_queue.empty():
                 await sleep(0)
@@ -139,7 +142,8 @@ async def get_ais_prediction():
 
             request_data = {"data": await json_encode_iso(data)}
             
-            response = await post_to_prediction_server(request_data, session)
+            prediction_server_url = f"http://{PREDICTION_SERVER_IP}:{PREDICTION_SERVER_PORT}/predict"
+            response = await post_to_server(request_data, session, prediction_server_url)
 
             if response:
                 prediction = pd.DataFrame(response["prediction"])
@@ -161,22 +165,43 @@ async def get_ais_prediction():
             
             await sleep(1)
 
-async def post_to_prediction_server(trajectory: dict, client_session: aiohttp.ClientSession):
-    prediction_server_url = f"http://{PREDICTION_SERVER_IP}:{PREDICTION_SERVER_PORT}/predict"
+async def post_to_server(data: dict, client_session: aiohttp.ClientSession, url: str):
     try:
-        async with client_session.post(prediction_server_url, json=trajectory) as response:
+        async with client_session.post(url, json=data) as response:
             if response.status == 200:
                 return await response.json()
             else:
-                logger.warning(f"Failed to post data to prediction server: {response}")
+                logger.warning(f"Failed to post data to {url}: {response}")
     except aiohttp.ClientError as e:
-        logger.error(f"Network error while posting to prediction server: {e}")
+        logger.error(f"Network error while posting to {url}: {e}")
         return None
+
+async def get_ais_cri():
+    async with aiohttp.ClientSession() as session:
+        while True:
+            if predictions.empty:
+                await sleep(1)
+                continue
+        
+            data = predictions[["timestamp", "mmsi", "lon", "lat"]]
+            data = await json_encode_iso(data)
+            request_data = {"data": data}
+            
+            cri_calc_server_url = f"http://{PREDICTION_SERVER_IP}:{PREDICTION_SERVER_PORT}/calculate_cri"
+            response = await post_to_server(request_data, session, cri_calc_server_url)
+
+            if response:
+                logger.debug(f"CRI received: {response}")
+            else:
+                logger.warning(f"No CRI received for data: {data}")
+            
+            await sleep(1)
 
 async def startup():
     asyncio.create_task(ais_state_updater())
     asyncio.create_task(preprocess_ais())
     asyncio.create_task(get_ais_prediction())
+    # asyncio.create_task(get_ais_cri)
 
 app.add_event_handler("startup", startup)
 
@@ -223,7 +248,7 @@ async def predictions_generator(mmsi: int | None):
         await sleep(10)
 
 async def sse_data_generator(mmsi: int | None, latitude_range: tuple | None, longitude_range: tuple | None):
-    # Start both generators
+    # Start generators
     if latitude_range is None and longitude_range is None:
         ais_gen = ais_data_generator()
     else:
@@ -290,6 +315,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--debug", action="store_true", help="Enable debug mode")
     args = parser.parse_args()
+
+    print(f"PREDICTION_SERVER_IP: {PREDICTION_SERVER_IP}")
+    print(f"PREDICTION_SERVER_PORT: {PREDICTION_SERVER_PORT}")
 
     if args.debug:
         LOG_LEVEL = logging.DEBUG
