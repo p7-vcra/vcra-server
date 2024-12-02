@@ -33,3 +33,6 @@ async def slice_query_validation(latitude_range: str, longitude_range: str):
 
 async def json_encode_iso(data: pd.DataFrame):
     return data.to_json(orient='records', date_format='iso')
+
+def format_event(event: str, data: str) -> str:
+    return f"event: {event}\ndata: {data}\n\n"

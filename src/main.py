@@ -13,7 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from asyncio import sleep
 from dotenv import load_dotenv 
 from datetime import datetime 
-from helpers import json_encode_iso, slice_query_validation
+from helpers import json_encode_iso, slice_query_validation, format_event
 
 
 
@@ -95,7 +95,7 @@ async def preprocess_ais():
         df, curr_timestamp = await get_current_ais_data()
         
         if df.empty:
-            logger.warning("There was no ais data for current time")
+            logger.warning(f"There was no ais data for current time: {curr_timestamp}")
             await sleep(1)
             continue
     
@@ -103,7 +103,7 @@ async def preprocess_ais():
         if prev_timestamp == curr_timestamp:
             await sleep(1)
             continue
-
+        
         filtered_data = await filter_ais_data(df)
 
         grouped_data = filtered_data.groupby("mmsi")
@@ -114,7 +114,10 @@ async def preprocess_ais():
             else:
                 vessel_data[name] = group
 
-            if len(vessel_data[name]) == vessel_records_threshold:
+            diff = datetime.combine(datetime.today(), curr_timestamp) - datetime.combine(datetime.today(), vessel_data[name]["timestamp"].iloc[0].time())
+            # logger.debug(f"Vessel {name} has {len(vessel_data[name])} records. Time difference: {diff}")            
+
+            if diff.total_seconds() >= 900:
                 await trajectory_queue.put(vessel_data[name]) 
                 # Clear vessel data for mmsi
                 vessel_data[name] = pd.DataFrame()
@@ -145,6 +148,9 @@ async def get_ais_prediction():
 
                 global predictions
                 prediction["mmsi"] = mmsi
+                prediction["timestamp"] = trajectory["timestamp"].values[1:]
+                prediction["lon"] = trajectory["longitude"].values[1:]
+                prediction["lat"] = trajectory["latitude"].values[1:]
 
                 if not predictions.empty:
                     predictions = pd.concat([predictions, prediction])
@@ -174,19 +180,19 @@ async def startup():
 
 app.add_event_handler("startup", startup)
 
-async def ais_lat_long_slice_generator(latitude_range: tuple, longitude_range: tuple):
+async def ais_lat_long_slice_generator(latitude_range: str | None = None, longitude_range: str | None = None):
     while True:  
         data, _ = await get_current_ais_data()
         data = data[data["latitude"].between(latitude_range[0], latitude_range[1]) & data["longitude"].between(longitude_range[0], longitude_range[1])]
         data = await json_encode_iso(data) 
-        yield 'event: ais\n' + 'data: ' + data + '\n\n'
+        yield format_event("ais", data)
         await sleep(1)
         
 async def ais_data_generator():
     while True: 
         data, _ = await get_current_ais_data()
         data = await json_encode_iso(data)
-        yield 'event: ais\n' + 'data: ' + data + '\n\n'
+        yield format_event("ais", data)
         await sleep(1)
 
 async def dummy_prediction_generator():
@@ -200,29 +206,55 @@ async def dummy_prediction_generator():
                     (timestamp <= time_delta)]
         data = data[["timestamp", "mmsi", "latitude", "longitude"]]
         data = await json_encode_iso(data) 
-        yield 'event: ais\n' + 'data: ' + data + '\n\n'
+        yield format_event("ais", data)
         await sleep(60)
 
 async def predictions_generator(mmsi: int | None):
-    cols = [f"lon(t+{i})" for i in range(1, 33)] + [f"lat(t+{i})" for i in range(1,33)]
+    cols = [f"lon(t+{i})" for i in range(1, 33)] + [f"lat(t+{i})" for i in range(1, 33)]
     while True:
         if not predictions.empty:
-            data = predictions[cols + ["mmsi"]]
+            data = predictions if mmsi is None else predictions[predictions["mmsi"] == str(mmsi)]
+            data = data[["timestamp", "mmsi", "lon", "lat"] + cols].drop_duplicates(subset=["mmsi"], keep="last")
             data = await json_encode_iso(data)
-        else: 
+        else:
             data = json.dumps([])
 
-        yield 'event: ais\n' + 'data: ' + data + '\n\n'
+        yield format_event("prediction", data)
         await sleep(10)
 
+async def sse_data_generator(mmsi: int | None, latitude_range: tuple | None, longitude_range: tuple | None):
+    # Start both generators
+    if latitude_range is None and longitude_range is None:
+        ais_gen = ais_data_generator()
+    else:
+        ais_gen = ais_lat_long_slice_generator(latitude_range, longitude_range)
+    
+    predictions_gen = predictions_generator(mmsi)
+
+    # Track the next events for each generator
+    next_ais_event = asyncio.create_task(ais_gen.__anext__())
+    next_predictions_event = asyncio.create_task(predictions_gen.__anext__())
+
+    while True:
+        # Wait for any generator to produce an event
+        done, _ = await asyncio.wait(
+            [next_ais_event, next_predictions_event],
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+
+        for task in done:
+            yield task.result()  # Yield the completed event
+
+            # Restart the generator that completed
+            if task == next_ais_event:
+                next_ais_event = asyncio.create_task(ais_gen.__anext__())
+            elif task == next_predictions_event:
+                next_predictions_event = asyncio.create_task(predictions_gen.__anext__())
+    
 async def get_current_ais_data():
     current_time = pd.Timestamp.now().time().replace(microsecond=0)
     timestamp = ais_state["data"]["timestamp"].dt.time
     result: pd.DataFrame = ais_state["data"][timestamp == current_time]
-
-    if result.empty:
-        logger.warning(f"Current time: {current_time} \n AIS Timestamp: {timestamp}")
-        logger.warning(f"AIS state: ", ais_state["data"])
 
     return result, current_time
 
@@ -248,8 +280,10 @@ async def location_slice(latitude_range: str | None = None, longitude_range: str
     return StreamingResponse(generator, media_type="text/event-stream")
 
 @app.get("/predictions")
-async def prediction_fetch(mmsi: int | None = None):
-    generator = predictions_generator(mmsi)
+async def prediction_fetch(mmsi: int | None = None, latitude_range: str | None = None, longitude_range: str | None = None):
+    if latitude_range is not None or longitude_range is not None:
+        latitude_range, longitude_range = await slice_query_validation(latitude_range, longitude_range)
+    generator = sse_data_generator(mmsi, latitude_range, longitude_range)
     return StreamingResponse(generator, media_type="text/event-stream")
 
 if __name__ == "__main__":
