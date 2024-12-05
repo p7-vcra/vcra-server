@@ -1,6 +1,5 @@
 import argparse
 import asyncio
-import json
 import os
 import numpy as np
 import uvicorn
@@ -20,8 +19,10 @@ DATA_FILE_PATH = os.getenv("PATH_TO_DATA_FOLDER")
 WORKERS = int(os.getenv("WORKERS", "1"))
 SOURCE_IP = os.getenv("SOURCE_IP", "0.0.0.0")
 SOURCE_PORT = int(os.getenv("SOURCE_PORT", "8000"))
-PREDICTION_SERVER_IP = os.getenv("PREDICTION_SERVER_IP")
-PREDICTION_SERVER_PORT = os.getenv("PREDICTION_SERVER_PORT")
+PREDICTION_SERVER_IP = os.getenv("PREDICTION_SERVER_IP", "0.0.0.0")
+PREDICTION_SERVER_PORT = os.getenv("PREDICTION_SERVER_PORT", "8001")
+CRI_SERVER_IP = os.getenv("CRI_SERVER_IP", "0.0.0.0")
+CRI_SERVER_PORT = os.getenv("CRI_SERVER_PORT", "8002")
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -37,7 +38,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-ais_state = {"data": pd.DataFrame(), "last_updated_hour": 0}
+AIS_STATE = {"data": pd.DataFrame(), "last_updated_hour": 0}
 
 PREDICTION_QUEUE = asyncio.Queue()
 
@@ -50,15 +51,15 @@ VESSEL_DATA = {}
 
 async def update_ais_state():
     current_hour = datetime.now().hour
-    ais_state["last_updated_hour"] = current_hour
+    AIS_STATE["last_updated_hour"] = current_hour
     try:
-        ais_state["data"] = pd.read_feather(
+        AIS_STATE["data"] = pd.read_feather(
             DATA_FILE_PATH + "aisdk-2024-09-09-hour-" + str(current_hour) + ".feather"
         )
-        ais_state["data"] = ais_state["data"].rename(
+        AIS_STATE["data"] = AIS_STATE["data"].rename(
             lambda x: x.lower(), axis="columns"
         )
-        ais_state["data"] = ais_state["data"].rename(
+        AIS_STATE["data"] = AIS_STATE["data"].rename(
             columns={"# timestamp": "timestamp"}
         )
         logger.info(f"Updated ais state. ({datetime.now().replace(microsecond=0)})")
@@ -71,8 +72,8 @@ async def update_ais_state():
 async def ais_state_updater():
     while True:
         if (
-            ais_state["last_updated_hour"] != datetime.now().hour
-            or ais_state["data"] is None
+            AIS_STATE["last_updated_hour"] != datetime.now().hour
+            or AIS_STATE["data"] is None
         ):
             try:
                 await update_ais_state()
@@ -115,7 +116,6 @@ async def preprocess_ais():
 
         grouped_data = filtered_data.groupby("mmsi")
 
-        # vessel_data = {}
         for name, group in grouped_data:
             if name in VESSEL_DATA:
                 VESSEL_DATA[name] = pd.concat([VESSEL_DATA[name], group])
@@ -216,7 +216,7 @@ async def get_ais_cri():
             request_data = {"data": data}
 
             cri_calc_server_url = (
-                f"http://{PREDICTION_SERVER_IP}:{PREDICTION_SERVER_PORT}/calculate_cri"
+                f"http://{CRI_SERVER_IP}:{CRI_SERVER_PORT}/calculate_cri"
             )
             response = await post_to_server(request_data, session, cri_calc_server_url)
 
@@ -232,7 +232,7 @@ async def startup():
     asyncio.create_task(ais_state_updater())
     asyncio.create_task(preprocess_ais())
     asyncio.create_task(get_ais_prediction())
-    # asyncio.create_task(get_ais_cri)
+    # asyncio.create_task(get_ais_cri())
 
 
 app.add_event_handler("startup", startup)
@@ -262,7 +262,7 @@ async def ais_data_generator():
 
 async def dummy_prediction_generator():
     while True:
-        data: pd.DataFrame = ais_state["data"]
+        data: pd.DataFrame = AIS_STATE["data"]
         current_time = pd.Timestamp.now()
         time_delta = (
             (current_time + pd.Timedelta(minutes=10)).time().replace(microsecond=0)
@@ -333,6 +333,8 @@ async def predictions_generator(mmsi: int | None):
                 aggfunc="first",  # Resolve duplicates (if any)
             ).reset_index()
 
+            df_final = df_final.rename(columns={"lat": "latitude", "lon": "longitude"})
+
             data = await json_encode_iso(df_final)
 
             yield format_event("prediction", data)
@@ -376,8 +378,8 @@ async def sse_data_generator(
 
 async def get_current_ais_data():
     current_time = pd.Timestamp.now().time().replace(microsecond=0)
-    timestamp = ais_state["data"]["timestamp"].dt.time
-    result: pd.DataFrame = ais_state["data"][timestamp == current_time]
+    timestamp = AIS_STATE["data"]["timestamp"].dt.time
+    result: pd.DataFrame = AIS_STATE["data"][timestamp == current_time]
 
     return result, current_time
 
