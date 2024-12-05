@@ -15,7 +15,7 @@ from datetime import datetime
 from helpers import json_encode_iso, slice_query_validation, format_event
 
 load_dotenv(".env")
-DATA_FILE_PATH = os.getenv("PATH_TO_DATA_FOLDER")
+DATA_FILE_PATH = os.getenv("PATH_TO_DATA_FOLDER", "data/")
 WORKERS = int(os.getenv("WORKERS", "1"))
 SOURCE_IP = os.getenv("SOURCE_IP", "0.0.0.0")
 SOURCE_PORT = int(os.getenv("SOURCE_PORT", "8000"))
@@ -73,7 +73,7 @@ async def ais_state_updater():
     while True:
         if (
             AIS_STATE["last_updated_hour"] != datetime.now().hour
-            or AIS_STATE["data"] is None
+            or AIS_STATE["data"].empty
         ):
             try:
                 await update_ais_state()
@@ -84,10 +84,12 @@ async def ais_state_updater():
 
 async def filter_ais_data(data: pd.DataFrame):
     # Remove invalid MMSI
-    data = data[(data["mmsi"] >= 201000000) & (data["mmsi"] <= 775999999)]
-    data = data.loc[data["navigational status"] != "Moored"]
-    data = data.loc[data["sog"] != 0]
-    data = data.loc[data["sog"] <= 50]
+    data = data[
+        (data["mmsi"] >= 201000000) & (data["mmsi"] <= 775999999) &
+        (data["navigational status"] != "Moored") &
+        (data["sog"] != 0) &
+        (data["sog"] <= 50)
+    ]
     data = data.drop_duplicates(subset=["timestamp", "mmsi"])
     data = data.dropna(subset=["longitude", "latitude", "sog", "cog"])
     data = data.replace([np.inf, -np.inf, np.nan], None)
@@ -239,7 +241,7 @@ app.add_event_handler("startup", startup)
 
 
 async def ais_lat_long_slice_generator(
-    latitude_range: str | None = None, longitude_range: str | None = None
+    latitude_range: tuple, longitude_range: tuple 
 ):
     while True:
         data, _ = await get_current_ais_data()
@@ -341,15 +343,17 @@ async def predictions_generator(mmsi: int | None):
 
         await sleep(10)
 
+async def get_ais_generator(latitude_range: str | None, longitude_range: str | None):
+    if latitude_range is None and longitude_range is None:
+        return ais_data_generator()
+    else:
+        return ais_lat_long_slice_generator(latitude_range, longitude_range)
+
 
 async def sse_data_generator(
     mmsi: int | None, latitude_range: tuple | None, longitude_range: tuple | None
 ):
-    # Start generators
-    if latitude_range is None and longitude_range is None:
-        ais_gen = ais_data_generator()
-    else:
-        ais_gen = ais_lat_long_slice_generator(latitude_range, longitude_range)
+    ais_gen = get_ais_generator(latitude_range, longitude_range)
 
     predictions_gen = predictions_generator(mmsi)
 
@@ -418,11 +422,11 @@ async def prediction_fetch(
     latitude_range: str | None = None,
     longitude_range: str | None = None,
 ):
-    if latitude_range is not None or longitude_range is not None:
-        latitude_range, longitude_range = await slice_query_validation(
+    latitude_range, longitude_range = await slice_query_validation(
             latitude_range, longitude_range
         )
-    generator = sse_data_generator(mmsi, latitude_range, longitude_range)
+    if (latitude_range and longitude_range) or (latitude_range is None and longitude_range is None):
+        generator = sse_data_generator(mmsi, latitude_range, longitude_range)
     return StreamingResponse(generator, media_type="text/event-stream")
 
 
