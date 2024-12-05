@@ -18,7 +18,7 @@ from helpers import json_encode_iso, slice_query_validation, format_event
 load_dotenv('.env')
 DATA_FILE_PATH = os.getenv('PATH_TO_DATA_FOLDER')
 WORKERS = int(os.getenv('WORKERS', '1'))
-SOURCE_IP = os.getenv('SOURCE_IP')
+SOURCE_IP = os.getenv('SOURCE_IP', '0.0.0.0')
 SOURCE_PORT = int(os.getenv('SOURCE_PORT', '8000'))
 PREDICTION_SERVER_IP = os.getenv('PREDICTION_SERVER_IP')
 PREDICTION_SERVER_PORT = os.getenv('PREDICTION_SERVER_PORT')
@@ -42,11 +42,13 @@ ais_state = {
     "last_updated_hour": 0
 }
 
-vessel_data = {}
+PREDICTION_QUEUE = asyncio.Queue()
 
-trajectory_queue = asyncio.Queue()
+TRAJECTORY_TIME_THRESHOLD = 60
 
-predictions = pd.DataFrame()
+PREDICTIONS = pd.DataFrame()
+
+VESSEL_DATA = {}
 
 async def update_ais_state():
     current_hour = datetime.now().hour
@@ -102,28 +104,30 @@ async def preprocess_ais():
         filtered_data = await filter_ais_data(df)
 
         grouped_data = filtered_data.groupby("mmsi")
-
+        
+        # vessel_data = {}
         for name, group in grouped_data:
-            if name in vessel_data:
-                vessel_data[name] = pd.concat([vessel_data[name], group])
+            if name in VESSEL_DATA:
+                VESSEL_DATA[name] = pd.concat([VESSEL_DATA[name], group])
             else:
-                vessel_data[name] = group
+                VESSEL_DATA[name] = group
 
-            diff = vessel_data[name]["timestamp"].max() - vessel_data[name]["timestamp"].min()
+            diff = VESSEL_DATA[name]["timestamp"].max() - VESSEL_DATA[name]["timestamp"].min()
 
-            if diff.total_seconds() >= 120:  
-                vessel_data[name].reset_index(drop=True, inplace=True)
-                vessel_data[name] = vessel_data[name].infer_objects(copy=False)
+            vessel_df = VESSEL_DATA[name]
+            if diff.total_seconds() >= TRAJECTORY_TIME_THRESHOLD:
+                vessel_df.reset_index(drop=True, inplace=True)
+                vessel_df = vessel_df.infer_objects(copy=False)
                 interp_cols = ["longitude", "latitude"]
-                vessel_data[name].loc[0, "timestamp"] = vessel_data[name].loc[0, "timestamp"].floor("min")
-                vessel_data[name] = vessel_data[name].set_index("timestamp")
-                vessel_data[name] = vessel_data[name].resample("1min").asfreq()
-                vessel_data[name][interp_cols] = vessel_data[name][interp_cols].interpolate(method="linear")
-                vessel_data[name] = vessel_data[name].ffill()
-                vessel_data[name].reset_index(inplace=True)
-                await trajectory_queue.put(vessel_data[name]) 
+                vessel_df.loc[0, "timestamp"] = vessel_df.loc[0, "timestamp"].floor("min")
+                vessel_df = vessel_df.set_index("timestamp")
+                vessel_df = vessel_df.resample("1min").asfreq()
+                vessel_df[interp_cols] = vessel_df[interp_cols].interpolate(method="linear")
+                vessel_df = vessel_df.ffill()
+                vessel_df.reset_index(inplace=True)
+                await PREDICTION_QUEUE.put(vessel_df) 
                 # Clear vessel data for mmsi
-                vessel_data[name] = pd.DataFrame()
+                VESSEL_DATA[name] = pd.DataFrame()
 
         prev_timestamp = curr_timestamp
         await sleep(1)
@@ -131,11 +135,11 @@ async def preprocess_ais():
 async def get_ais_prediction():
     async with aiohttp.ClientSession() as session:
         while True:
-            if trajectory_queue.empty():
+            if PREDICTION_QUEUE.empty():
                 await sleep(0)
                 continue
 
-            trajectory = await trajectory_queue.get()
+            trajectory = await PREDICTION_QUEUE.get()
             mmsi = str(trajectory["mmsi"].values[0])
 
             data = trajectory[["timestamp", "longitude", "latitude"]]
@@ -150,16 +154,16 @@ async def get_ais_prediction():
 
                 logger.debug(f"Prediction received: {prediction}")
 
-                global predictions
+                global PREDICTIONS
                 prediction["mmsi"] = mmsi
                 prediction["timestamp"] = trajectory["timestamp"].values[1:]
                 prediction["lon"] = trajectory["longitude"].values[1:]
                 prediction["lat"] = trajectory["latitude"].values[1:]
 
-                if not predictions.empty:
-                    predictions = pd.concat([predictions, prediction])
+                if not PREDICTIONS.empty:
+                    PREDICTIONS = pd.concat([PREDICTIONS, prediction])
                 else:
-                    predictions = prediction
+                    PREDICTIONS = prediction
             else:
                 logger.warning(f"No prediction received for trajectory: {trajectory}")
             
@@ -179,14 +183,14 @@ async def post_to_server(data: dict, client_session: aiohttp.ClientSession, url:
 async def get_ais_cri():
     async with aiohttp.ClientSession() as session:
         while True:
-            if predictions.empty:
+            if PREDICTIONS.empty:
                 await sleep(1)
                 continue
         
-            data = predictions[["timestamp", "mmsi", "lon", "lat"]]
+            data = PREDICTIONS[["timestamp", "mmsi", "lon", "lat"]]
             data = await json_encode_iso(data)
             request_data = {"data": data}
-            
+
             cri_calc_server_url = f"http://{PREDICTION_SERVER_IP}:{PREDICTION_SERVER_PORT}/calculate_cri"
             response = await post_to_server(request_data, session, cri_calc_server_url)
 
@@ -235,16 +239,48 @@ async def dummy_prediction_generator():
         await sleep(60)
 
 async def predictions_generator(mmsi: int | None):
-    cols = [f"lon(t+{i})" for i in range(1, 33)] + [f"lat(t+{i})" for i in range(1, 33)]
+    predicted_cols = [f"lon(t+{i})" for i in range(1, 33)] + [f"lat(t+{i})" for i in range(1, 33)]
     while True:
-        if not predictions.empty:
-            data = predictions if mmsi is None else predictions[predictions["mmsi"] == str(mmsi)]
-            data = data[["timestamp", "mmsi", "lon", "lat"] + cols].drop_duplicates(subset=["mmsi"], keep="last")
-            data = await json_encode_iso(data)
-        else:
-            data = json.dumps([])
+        if not PREDICTIONS.empty:
+            # If MMSI is provided in query, filter PREDICTIONS for that MMSI, else return all predictions
+            PREDICTIONS.loc[:, "mmsi"] = PREDICTIONS.loc[:, "mmsi"].astype(float).astype(int)
+            data = PREDICTIONS if mmsi is None else PREDICTIONS[PREDICTIONS["mmsi"] == mmsi]
+            data = data[["timestamp", "mmsi", "lon", "lat"] + predicted_cols].drop_duplicates(subset=["mmsi"], keep="last")
 
-        yield format_event("prediction", data)
+            # Tranform predicted columns into rows for each timestamp
+            # Melt only the future lat and lon columns
+            df_melted = pd.melt(
+                data,
+                id_vars=['timestamp', 'mmsi'],  # Keep these columns intact
+                value_vars=predicted_cols,         # Only melt future columns
+                var_name='coordinate_time',     # New column for melted keys
+                value_name='value'              # New column for melted values
+            )
+
+            # Extract 'coordinate' (lon/lat) and 'time_step' (t+1, t+2, etc.)
+            df_melted[['coordinate', 'time_step']] = df_melted['coordinate_time'].str.extract(r'(lon|lat)\(t\+(\d+)\)')
+
+            # Convert 'time_step' to numeric
+            df_melted['time_step'] = pd.to_numeric(df_melted['time_step'], errors='coerce')
+
+            # Drop rows with invalid extraction (i.e., when regex didn't match)
+            df_melted = df_melted.dropna(subset=['coordinate', 'time_step'])
+
+            # Increment timestamp by timestep
+            df_melted['timestamp'] = df_melted['timestamp'] + pd.to_timedelta(df_melted['time_step'], unit='m')
+
+            # Step 8: Pivot to separate lat and lon into different columns
+            df_final = df_melted.pivot_table(
+                index=['timestamp', 'mmsi'],  # Group by timestamp and mmsi
+                columns='coordinate',         # Separate lat and lon
+                values='value',               # Use the melted values
+                aggfunc='first'               # Resolve duplicates (if any)
+            ).reset_index()
+
+            data = await json_encode_iso(df_final)
+
+            yield format_event("prediction", data)
+
         await sleep(10)
 
 async def sse_data_generator(mmsi: int | None, latitude_range: tuple | None, longitude_range: tuple | None):
@@ -315,9 +351,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--debug", action="store_true", help="Enable debug mode")
     args = parser.parse_args()
-
-    print(f"PREDICTION_SERVER_IP: {PREDICTION_SERVER_IP}")
-    print(f"PREDICTION_SERVER_PORT: {PREDICTION_SERVER_PORT}")
 
     if args.debug:
         LOG_LEVEL = logging.DEBUG
