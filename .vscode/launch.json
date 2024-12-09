@@ -1,0 +1,26 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Python Debugger: FastAPI",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "uvicorn",
+      "args": ["src.main:app", "--reload"],
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}/src"
+      },
+      "jinja": true,
+      "console": "integratedTerminal",
+      "python": "venv/bin/python" // Add this line
+    },
+    {
+      "name": "Python Debugger: Current File with Arguments",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${file}",
+      "console": "integratedTerminal",
+      "args": ["${command:pickArgs}"]
+    }
+  ]
+}
