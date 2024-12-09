@@ -415,7 +415,7 @@ async def CRI_generator():
         else:
             data = []
 
-        yield format_event("CRI", data)
+        yield format_event("cri", data)
         await sleep(10)
 
 
