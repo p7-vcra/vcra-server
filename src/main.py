@@ -46,6 +46,8 @@ TRAJECTORY_TIME_THRESHOLD = 900
 
 PREDICTIONS = pd.DataFrame()
 
+CRI_for_vessels = pd.DataFrame()
+
 VESSEL_DATA = {}
 
 
