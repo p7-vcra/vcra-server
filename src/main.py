@@ -42,7 +42,7 @@ AIS_STATE = {"data": pd.DataFrame(), "last_updated_hour": 0}
 
 PREDICTION_QUEUE = asyncio.Queue()
 
-TRAJECTORY_TIME_THRESHOLD = 60
+TRAJECTORY_TIME_THRESHOLD = 900
 
 PREDICTIONS = pd.DataFrame()
 
