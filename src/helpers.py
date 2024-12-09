@@ -2,6 +2,19 @@ from fastapi import HTTPException
 import pandas as pd
 
 async def slice_query_validation(latitude_range: str, longitude_range: str):
+    """
+    Validates and parses latitude and longitude range query parameters.
+    Args:
+        latitude_range (str): A string representing the latitude range in the format "min,max".
+        longitude_range (str): A string representing the longitude range in the format "min,max".
+    Returns:
+        tuple: A tuple containing two tuples:
+            - The first tuple contains the minimum and maximum latitude as floats.
+            - The second tuple contains the minimum and maximum longitude as floats.
+    Raises:
+        HTTPException: If the input strings are not in the expected format, or if the values are not valid numbers,
+                       or if the minimum value is greater than the maximum value.
+    """
     
     try:
         latitude_range = latitude_range.split(",")
