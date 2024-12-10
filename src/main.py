@@ -152,12 +152,13 @@ async def preprocess_ais():
                     "min"
                 )
                 vessel_df = vessel_df.set_index("timestamp")
-                vessel_df = vessel_df.resample("1min").asfreq()
+                vessel_df = vessel_df[interp_cols].resample("1min").mean()
                 vessel_df[interp_cols] = vessel_df[interp_cols].interpolate(
                     method="linear"
                 )
                 vessel_df = vessel_df.ffill()
                 vessel_df.reset_index(inplace=True)
+                vessel_df["mmsi"] = name
                 await PREDICTION_QUEUE.put(vessel_df)
                 # Clear vessel data for mmsi
                 VESSEL_DATA[name] = pd.DataFrame()
