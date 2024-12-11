@@ -163,6 +163,7 @@ async def preprocess_ais():
                 await PREDICTION_QUEUE.put(vessel_df)
                 # Clear vessel data for mmsi
                 VESSEL_DATA[name] = vessel_df.iloc[2:]
+  
         prev_timestamp = curr_timestamp
         await sleep(1)
 
