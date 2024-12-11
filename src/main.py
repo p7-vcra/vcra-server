@@ -71,6 +71,7 @@ async def update_ais_state():
         AIS_STATE["data"] = AIS_STATE["data"].rename(
             columns={"# timestamp": "timestamp"}
         )
+
         logger.info(f"Updated ais state. ({datetime.now().replace(microsecond=0)})")
     except FileNotFoundError:
         logger.error(f"File not found for hour {current_hour}.")
@@ -103,6 +104,9 @@ async def filter_ais_data(data: pd.DataFrame):
     data = data.drop_duplicates(subset=["timestamp", "mmsi"])
     data = data.dropna(subset=["longitude", "latitude", "sog", "cog"])
     data = data.replace([np.inf, -np.inf, np.nan], None)
+
+    data["longitude"] = pd.to_numeric(data["longitude"], errors="coerce")
+    data["latitude"] = pd.to_numeric(data["latitude"], errors="coerce")
 
     data.reset_index(drop=True, inplace=True)
     return data
@@ -146,21 +150,49 @@ async def preprocess_ais():
             logger.debug(f"Time difference for vessel {name}: {diff}")
 
             if diff.total_seconds() >= TRAJECTORY_TIME_THRESHOLD:
+
+                # Ensure the 'timestamp' column is in datetime format
+                vessel_df["timestamp"] = pd.to_datetime(vessel_df["timestamp"])
+
+                # Reset index to avoid the timestamp being the index
                 vessel_df.reset_index(drop=True, inplace=True)
-                vessel_df = vessel_df.infer_objects(copy=False)
-                interp_cols = ["longitude", "latitude"]
-                vessel_df.loc[0, "timestamp"] = vessel_df.loc[0, "timestamp"].floor(
-                    "min"
+
+                # Create start and end time boundaries
+                start_time = vessel_df["timestamp"].min().floor("min")
+                end_time = vessel_df["timestamp"].max()
+
+                # Generate complete range of timestamps at 1-minute intervals
+                complete_range = pd.date_range(
+                    start=start_time, end=end_time, freq="1min"
                 )
-                vessel_df = vessel_df.set_index("timestamp")
-                vessel_df = vessel_df[interp_cols].resample("1min").mean()
-                vessel_df[interp_cols] = vessel_df[interp_cols].interpolate(
-                    method="linear"
+                interpolated_df = pd.DataFrame(index=complete_range)
+
+                # Interpolate the longitude and latitude values
+                interpolated_df["longitude"] = np.interp(
+                    interpolated_df.index.astype("int64"),
+                    vessel_df["timestamp"].astype("int64"),
+                    vessel_df["longitude"],
                 )
-                vessel_df = vessel_df.ffill()
-                vessel_df.reset_index(inplace=True)
-                vessel_df["mmsi"] = name
-                await PREDICTION_QUEUE.put(vessel_df)
+                interpolated_df["latitude"] = np.interp(
+                    interpolated_df.index.astype("int64"),
+                    vessel_df["timestamp"].astype("int64"),
+                    vessel_df["latitude"],
+                )
+
+                # Add the 'timestamp' as a column instead of index in the interpolated dataframe
+                interpolated_df["timestamp"] = interpolated_df.index
+
+                interpolated_df["mmsi"] = name
+
+                interpolated_df.reset_index(drop=True, inplace=True)
+
+                interpolated_df = interpolated_df[
+                    ["timestamp", "mmsi", "latitude", "longitude"]
+                ]
+
+                # Add the interpolated data to the prediction queue
+                await PREDICTION_QUEUE.put(interpolated_df)
+
                 # Clear vessel data for mmsi
                 VESSEL_DATA[name] = vessel_df.iloc[1:]
   
@@ -235,6 +267,7 @@ async def get_current_CRI_and_clusters_for_vessels():
 
 async def post_to_server(data: dict, client_session: aiohttp.ClientSession, url: str):
     try:
+        logger.info(f"Posting data to {url}")
         async with client_session.post(url, json=data) as response:
             if response.status == 200:
                 return await response.json()
