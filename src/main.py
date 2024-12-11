@@ -42,7 +42,7 @@ AIS_STATE = {"data": pd.DataFrame(), "last_updated_hour": 0}
 
 PREDICTION_QUEUE = asyncio.Queue()
 
-TRAJECTORY_TIME_THRESHOLD = 1
+TRAJECTORY_TIME_THRESHOLD = 1920  # 32 mins (We need to predict same amount of minutes as we have look ahead points in the model, to calculate predicted speed)
 
 PREDICTIONS = pd.DataFrame()
 
@@ -142,66 +142,62 @@ async def preprocess_ais():
             else:
                 VESSEL_DATA[name] = group
 
+            vessel_df: pd.DataFrame = VESSEL_DATA[name]
             diff = (
-                VESSEL_DATA[name]["timestamp"].max()
-                - VESSEL_DATA[name]["timestamp"].min()
+                vessel_df["timestamp"].max()
+                - vessel_df["timestamp"].min()
             )
+            logger.debug(f"Time difference for vessel {name}: {diff}")
 
-            vessel_df = VESSEL_DATA[name]
             if diff.total_seconds() >= TRAJECTORY_TIME_THRESHOLD:
 
-                try:
-                    # Ensure the 'timestamp' column is in datetime format
-                    vessel_df["timestamp"] = pd.to_datetime(vessel_df["timestamp"])
+                # Ensure the 'timestamp' column is in datetime format
+                vessel_df["timestamp"] = pd.to_datetime(vessel_df["timestamp"])
 
-                    # Reset index to avoid the timestamp being the index
-                    vessel_df.reset_index(drop=True, inplace=True)
+                # Reset index to avoid the timestamp being the index
+                vessel_df.reset_index(drop=True, inplace=True)
 
-                    # Create start and end time boundaries
-                    start_time = vessel_df["timestamp"].min().floor("min")
-                    end_time = vessel_df["timestamp"].max()
+                # Create start and end time boundaries
+                start_time = vessel_df["timestamp"].min().floor("min")
+                end_time = vessel_df["timestamp"].max()
 
-                    # Generate complete range of timestamps at 1-minute intervals
-                    complete_range = pd.date_range(
-                        start=start_time, end=end_time, freq="1min"
-                    )
-                    interpolated_df = pd.DataFrame(index=complete_range)
+                # Generate complete range of timestamps at 1-minute intervals
+                complete_range = pd.date_range(
+                    start=start_time, end=end_time, freq="1min"
+                )
+                interpolated_df = pd.DataFrame(index=complete_range)
 
-                    # Interpolate the longitude and latitude values
-                    interpolated_df["longitude"] = np.interp(
-                        interpolated_df.index.astype("int64"),
-                        vessel_df["timestamp"].astype("int64"),
-                        vessel_df["longitude"],
-                    )
-                    interpolated_df["latitude"] = np.interp(
-                        interpolated_df.index.astype("int64"),
-                        vessel_df["timestamp"].astype("int64"),
-                        vessel_df["latitude"],
-                    )
+                # Interpolate the longitude and latitude values
+                interpolated_df["longitude"] = np.interp(
+                    interpolated_df.index.astype("int64"),
+                    vessel_df["timestamp"].astype("int64"),
+                    vessel_df["longitude"],
+                )
+                interpolated_df["latitude"] = np.interp(
+                    interpolated_df.index.astype("int64"),
+                    vessel_df["timestamp"].astype("int64"),
+                    vessel_df["latitude"],
+                )
 
-                    # Add the 'timestamp' as a column instead of index in the interpolated dataframe
-                    interpolated_df["timestamp"] = interpolated_df.index
+                # Add the 'timestamp' as a column instead of index in the interpolated dataframe
+                interpolated_df["timestamp"] = interpolated_df.index
 
-                    interpolated_df["mmsi"] = name
+                interpolated_df["mmsi"] = name
 
-                    interpolated_df.reset_index(drop=True, inplace=True)
+                interpolated_df.reset_index(drop=True, inplace=True)
 
-                    interpolated_df = interpolated_df[
-                        ["timestamp", "mmsi", "latitude", "longitude"]
-                    ]
+                interpolated_df = interpolated_df[
+                    ["timestamp", "mmsi", "latitude", "longitude"]
+                ]
 
-                    # Add the interpolated data to the prediction queue
-                    await PREDICTION_QUEUE.put(interpolated_df)
-
-                except Exception as e:
-                    # print whole exception
-                    logger.exception("Error while preprocessing AIS data")
+                # Add the interpolated data to the prediction queue
+                await PREDICTION_QUEUE.put(interpolated_df)
 
                 # Clear vessel data for mmsi
-                VESSEL_DATA[name] = pd.DataFrame()
-
-            prev_timestamp = curr_timestamp
-            await sleep(1)
+                VESSEL_DATA[name] = vessel_df.iloc[1:]
+  
+        prev_timestamp = curr_timestamp
+        await sleep(1)
 
 
 async def get_ais_prediction():
@@ -230,8 +226,6 @@ async def get_ais_prediction():
 
             if response:
                 prediction = pd.DataFrame(response["prediction"])
-
-                logger.debug(f"Prediction received: {prediction}")
 
                 global PREDICTIONS
                 prediction["mmsi"] = mmsi
@@ -309,6 +303,7 @@ async def get_ais_cri():
 
 
 async def startup():
+    app.state.start_time = datetime.now()
     asyncio.create_task(ais_state_updater())
     asyncio.create_task(preprocess_ais())
     asyncio.create_task(get_ais_prediction())
@@ -503,6 +498,11 @@ async def get_current_ais_data():
 
     return result, current_time
 
+@app.get("/uptime")
+async def uptime():
+    # Time elapsed since server startup
+    uptime = str(datetime.now() - app.state.start_time)
+    return {"uptime": uptime}   
 
 @app.get("/dummy-ais-data")
 async def ais_data_fetch():
