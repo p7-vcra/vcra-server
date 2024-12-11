@@ -42,7 +42,7 @@ AIS_STATE = {"data": pd.DataFrame(), "last_updated_hour": 0}
 
 PREDICTION_QUEUE = asyncio.Queue()
 
-TRAJECTORY_TIME_THRESHOLD = 900
+TRAJECTORY_TIME_THRESHOLD = 1920  # 32 mins (We need to predict same amount of minutes as we have look ahead points in the model, to calculate predicted speed)
 
 PREDICTIONS = pd.DataFrame()
 
@@ -138,12 +138,13 @@ async def preprocess_ais():
             else:
                 VESSEL_DATA[name] = group
 
+            vessel_df: pd.DataFrame = VESSEL_DATA[name]
             diff = (
-                VESSEL_DATA[name]["timestamp"].max()
-                - VESSEL_DATA[name]["timestamp"].min()
+                vessel_df["timestamp"].max()
+                - vessel_df["timestamp"].min()
             )
+            logger.debug(f"Time difference for vessel {name}: {diff}")
 
-            vessel_df = VESSEL_DATA[name]
             if diff.total_seconds() >= TRAJECTORY_TIME_THRESHOLD:
                 vessel_df.reset_index(drop=True, inplace=True)
                 vessel_df = vessel_df.infer_objects(copy=False)
@@ -161,7 +162,8 @@ async def preprocess_ais():
                 vessel_df["mmsi"] = name
                 await PREDICTION_QUEUE.put(vessel_df)
                 # Clear vessel data for mmsi
-                VESSEL_DATA[name] = vessel_df.iloc[1:]
+                VESSEL_DATA[name] = vessel_df.iloc[2:]
+  
         prev_timestamp = curr_timestamp
         await sleep(1)
 
@@ -192,8 +194,6 @@ async def get_ais_prediction():
 
             if response:
                 prediction = pd.DataFrame(response["prediction"])
-
-                logger.debug(f"Prediction received: {prediction}")
 
                 global PREDICTIONS
                 prediction["mmsi"] = mmsi
@@ -270,6 +270,7 @@ async def get_ais_cri():
 
 
 async def startup():
+    app.state.start_time = datetime.now()
     asyncio.create_task(ais_state_updater())
     asyncio.create_task(preprocess_ais())
     asyncio.create_task(get_ais_prediction())
@@ -464,6 +465,11 @@ async def get_current_ais_data():
 
     return result, current_time
 
+@app.get("/uptime")
+async def uptime():
+    # Time elapsed since server startup
+    uptime = str(datetime.now() - app.state.start_time)
+    return {"uptime": uptime}   
 
 @app.get("/dummy-ais-data")
 async def ais_data_fetch():
