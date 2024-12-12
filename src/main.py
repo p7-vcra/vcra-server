@@ -1,11 +1,13 @@
 import argparse
 import asyncio
+from io import StringIO
 import os
 import numpy as np
 import uvicorn
 import pandas as pd
 import logging
 import aiohttp
+import aioredis
 from fastapi import FastAPI
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -23,6 +25,7 @@ PREDICTION_SERVER_IP = os.getenv("PREDICTION_SERVER_IP", "0.0.0.0")
 PREDICTION_SERVER_PORT = os.getenv("PREDICTION_SERVER_PORT", "8001")
 CRI_SERVER_IP = os.getenv("CRI_SERVER_IP", "0.0.0.0")
 CRI_SERVER_PORT = os.getenv("CRI_SERVER_PORT", "8002")
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -42,13 +45,59 @@ AIS_STATE = {"data": pd.DataFrame(), "last_updated_hour": 0}
 
 PREDICTION_QUEUE = asyncio.Queue()
 
-TRAJECTORY_TIME_THRESHOLD = 1920  # 32 mins (We need to predict same amount of minutes as we have look ahead points in the model, to calculate predicted speed)
+TRAJECTORY_TIME_THRESHOLD = 60  # 32 mins (We need to predict same amount of minutes as we have look ahead points in the model, to calculate predicted speed)
 
 PREDICTIONS = pd.DataFrame()
 
 CRI_for_vessels = pd.DataFrame()
 
 VESSEL_DATA = {}
+
+
+async def get_redis_connection():
+    return await aioredis.from_url(REDIS_URL)
+
+async def consume_prediction_queue():
+    redis = app.state.redis
+    while True:
+        try:
+            # Blocking pop for a task
+            task = await redis.blpop("prediction_queue", timeout=5)
+            if task:
+                _, task_data = task
+                trajectory = pd.read_json(StringIO(task_data.decode("utf-8")))
+                await get_ais_prediction(trajectory)
+
+                # Remove the task from the tracking set
+                mmsi = trajectory["mmsi"].iloc[0]
+                timestamp = trajectory["timestamp"].iloc[0]
+                task_id = f"{mmsi}:{timestamp}"
+                await redis.srem("queued_tasks", task_id)
+                logger.info(f"Processed and removed task {task_id} from tracking set")
+                size = await redis.scard("queued_tasks")
+                logger.info(f"Queued tasks set size: {size}")
+
+        except Exception as e:
+            logger.error(f"Error consuming prediction queue: {e}")
+        await asyncio.sleep(1)
+
+async def add_to_prediction_queue(vessel_df):
+    redis = app.state.redis
+    mmsi = vessel_df["mmsi"].iloc[0]
+    timestamp = vessel_df["timestamp"].iloc[0]
+
+    # Create a unique identifier for the task
+    task_id = f"{mmsi}:{timestamp}"
+
+    # Use Redis set to ensure uniqueness
+    is_new = await redis.sadd("queued_tasks", task_id)
+    if is_new:
+        # If the task is new, add it to the queue
+        await redis.rpush("prediction_queue", vessel_df.to_json())
+        logger.info(f"Queued new task for MMSI {mmsi} at {timestamp}")
+    else:
+        logger.debug(f"Skipped queuing duplicate task for MMSI {mmsi} at {timestamp}")
+
 
 
 async def update_ais_state():
@@ -160,55 +209,50 @@ async def preprocess_ais():
                 vessel_df = vessel_df.ffill()
                 vessel_df.reset_index(inplace=True)
                 vessel_df["mmsi"] = name
-                await PREDICTION_QUEUE.put(vessel_df)
+                
+                await add_to_prediction_queue(vessel_df)
+
                 # Clear vessel data for mmsi
-                VESSEL_DATA[name] = vessel_df.iloc[1:]
+                VESSEL_DATA[name] = vessel_df.iloc[2:]
   
         prev_timestamp = curr_timestamp
         await sleep(1)
 
 
-async def get_ais_prediction():
+async def get_ais_prediction(trajectory: pd.DataFrame):
     """
     Sends the AIS data from the prediction queue to the prediction server and receives the predictions.
     """
     async with aiohttp.ClientSession() as session:
-        while True:
-            if PREDICTION_QUEUE.empty():
-                await sleep(0)
-                continue
+        data = trajectory[["timestamp", "longitude", "latitude"]]
 
-            trajectory = await PREDICTION_QUEUE.get()
-            mmsi = str(trajectory["mmsi"].values[0])
+        request_data = {"data": await json_encode_iso(data)}
 
-            data = trajectory[["timestamp", "longitude", "latitude"]]
+        prediction_server_url = (
+            f"http://{PREDICTION_SERVER_IP}:{PREDICTION_SERVER_PORT}/predict"
+        )
+        response = await post_to_server(
+            request_data, session, prediction_server_url
+        )
 
-            request_data = {"data": await json_encode_iso(data)}
+        if response:
+            prediction = pd.DataFrame(response["prediction"])
 
-            prediction_server_url = (
-                f"http://{PREDICTION_SERVER_IP}:{PREDICTION_SERVER_PORT}/predict"
-            )
-            response = await post_to_server(
-                request_data, session, prediction_server_url
-            )
+            global PREDICTIONS
+            prediction["mmsi"] = str(trajectory["mmsi"].values[0])
+            prediction["timestamp"] = trajectory["timestamp"].values[1:]
+            prediction["lon"] = trajectory["longitude"].values[1:]
+            prediction["lat"] = trajectory["latitude"].values[1:]
 
-            if response:
-                prediction = pd.DataFrame(response["prediction"])
 
-                global PREDICTIONS
-                prediction["mmsi"] = mmsi
-                prediction["timestamp"] = trajectory["timestamp"].values[1:]
-                prediction["lon"] = trajectory["longitude"].values[1:]
-                prediction["lat"] = trajectory["latitude"].values[1:]
-
-                if not PREDICTIONS.empty:
-                    PREDICTIONS = pd.concat([PREDICTIONS, prediction])
-                else:
-                    PREDICTIONS = prediction
+            if not PREDICTIONS.empty:
+                PREDICTIONS = pd.concat([PREDICTIONS, prediction])
             else:
-                logger.warning(f"No prediction received for trajectory: {trajectory}")
+                PREDICTIONS = prediction
+        else:
+            logger.warning(f"No prediction received for trajectory: {trajectory}")
 
-            await sleep(1)
+        await sleep(1)
 
 
 async def get_current_CRI_and_clusters_for_vessels():
@@ -271,10 +315,13 @@ async def get_ais_cri():
 
 async def startup():
     app.state.start_time = datetime.now()
+    app.state.redis = await get_redis_connection()
     asyncio.create_task(ais_state_updater())
     asyncio.create_task(preprocess_ais())
-    asyncio.create_task(get_ais_prediction())
     asyncio.create_task(get_current_CRI_and_clusters_for_vessels())
+    
+    for _ in range(WORKERS):
+        asyncio.create_task(consume_prediction_queue())
 
 
 app.add_event_handler("startup", startup)
@@ -347,11 +394,6 @@ async def predictions_generator(mmsi: int | None):
                 if mmsi is None
                 else PREDICTIONS[PREDICTIONS["mmsi"] == mmsi]
             )
-
-            # Keep only last row in prediction since this is the most recent position for the vessel
-            data = data[
-                ["timestamp", "mmsi", "lon", "lat"] + predicted_cols
-            ].drop_duplicates(subset=["mmsi"], keep="last")
 
             # Tranform predicted columns into rows for each timestamp
             # Melt only the future lat and lon columns
