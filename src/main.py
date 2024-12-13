@@ -44,8 +44,7 @@ app.add_middleware(
 AIS_STATE = {"data": pd.DataFrame(), "last_updated_hour": 0}
 
 PREDICTION_QUEUE = asyncio.Queue()
-
-TRAJECTORY_TIME_THRESHOLD = 60  # 32 mins (We need to predict same amount of minutes as we have look ahead points in the model, to calculate predicted speed)
+TRAJECTORY_TIME_THRESHOLD = 1920 # 32 mins (We need to predict same amount of minutes as we have look ahead points in the model, to calculate predicted speed)
 
 PREDICTIONS = pd.DataFrame()
 
@@ -53,6 +52,7 @@ CRI_for_vessels = pd.DataFrame()
 
 VESSEL_DATA = {}
 
+BATCH_SIZE = 32 
 
 async def get_redis_connection():
     return await aioredis.from_url(REDIS_URL)
@@ -60,44 +60,26 @@ async def get_redis_connection():
 async def consume_prediction_queue():
     redis = app.state.redis
     while True:
-        try:
-            # Blocking pop for a task
-            task = await redis.blpop("prediction_queue", timeout=5)
-            if task:
-                _, task_data = task
-                trajectory = pd.read_json(StringIO(task_data.decode("utf-8")))
-                await get_ais_prediction(trajectory)
+        # Blocking pop for a task
+        task = await redis.blpop("prediction_queue", timeout=5)
+        if task:
+            _, task_data = task
+            batch = pd.read_json(StringIO(task_data.decode("utf-8")))
 
-                # Remove the task from the tracking set
-                mmsi = trajectory["mmsi"].iloc[0]
-                timestamp = trajectory["timestamp"].iloc[0]
+            await get_ais_prediction(batch)
+            # After processing, remove each task (mmsi:timestamp) from the Redis set
+            for mmsi, vessel in batch.groupby("mmsi"):  # Loop through the vessels in the batch
+                mmsi = mmsi  # MMSI of the vessel
+                timestamp = vessel["timestamp"].iloc[0]  # Timestamp of the vessel
                 task_id = f"{mmsi}:{timestamp}"
-                await redis.srem("queued_tasks", task_id)
-                logger.info(f"Processed and removed task {task_id} from tracking set")
-                size = await redis.scard("queued_tasks")
-                logger.info(f"Queued tasks set size: {size}")
 
-        except Exception as e:
-            logger.error(f"Error consuming prediction queue: {e}")
+                # Remove from the tracking set (processed_tasks)
+                await redis.srem("processed_tasks", task_id)
+                logger.debug(f"Removed task {task_id} from processed tasks set")
+            
+            size = await redis.llen("prediction_queue")
+            logger.debug(f"Queued tasks set size: {size}")
         await asyncio.sleep(1)
-
-async def add_to_prediction_queue(vessel_df):
-    redis = app.state.redis
-    mmsi = vessel_df["mmsi"].iloc[0]
-    timestamp = vessel_df["timestamp"].iloc[0]
-
-    # Create a unique identifier for the task
-    task_id = f"{mmsi}:{timestamp}"
-
-    # Use Redis set to ensure uniqueness
-    is_new = await redis.sadd("queued_tasks", task_id)
-    if is_new:
-        # If the task is new, add it to the queue
-        await redis.rpush("prediction_queue", vessel_df.to_json())
-        logger.info(f"Queued new task for MMSI {mmsi} at {timestamp}")
-    else:
-        logger.debug(f"Skipped queuing duplicate task for MMSI {mmsi} at {timestamp}")
-
 
 
 async def update_ais_state():
@@ -163,6 +145,7 @@ async def preprocess_ais():
     Also finds out which ships can be sent for prediction based on the time difference between the first and last record.
     """
     prev_timestamp = 0
+    batch = []
 
     while True:
         df, curr_timestamp = await get_current_ais_data()
@@ -187,7 +170,7 @@ async def preprocess_ais():
             else:
                 VESSEL_DATA[name] = group
 
-            vessel_df: pd.DataFrame = VESSEL_DATA[name]
+            vessel_df: pd.DataFrame = VESSEL_DATA[name].copy()
             diff = (
                 vessel_df["timestamp"].max()
                 - vessel_df["timestamp"].min()
@@ -201,6 +184,10 @@ async def preprocess_ais():
                 vessel_df.loc[0, "timestamp"] = vessel_df.loc[0, "timestamp"].floor(
                     "min"
                 )
+                
+                # max_timestamp = vessel_df["timestamp"].iloc[0] + pd.Timedelta(TRAJECTORY_TIME_THRESHOLD + 60, unit="s")
+                # vessel_df = vessel_df[vessel_df["timestamp"] < max_timestamp]
+
                 vessel_df = vessel_df.set_index("timestamp")
                 vessel_df = vessel_df[interp_cols].resample("1min").mean()
                 vessel_df[interp_cols] = vessel_df[interp_cols].interpolate(
@@ -209,22 +196,62 @@ async def preprocess_ais():
                 vessel_df = vessel_df.ffill()
                 vessel_df.reset_index(inplace=True)
                 vessel_df["mmsi"] = name
-                
-                await add_to_prediction_queue(vessel_df)
 
-                # Clear vessel data for mmsi
-                VESSEL_DATA[name] = vessel_df.iloc[2:]
+                expected_df_len = (TRAJECTORY_TIME_THRESHOLD / 60) + 1
+                # This is pretty scuffed, but works. Might have to truncate data points before the resampling
+                vessel_df = vessel_df.iloc[:int(expected_df_len)]
+
+                # Check if this MMSI and timestamp pair has been processed
+                mmsi = name
+                timestamp = vessel_df["timestamp"].iloc[0]
+                task_id = f"{name}:{timestamp}"
+
+                redis = app.state.redis
+                
+                # Check if the MMSI and timestamp combination is already in Redis
+                is_new = await redis.sadd("processed_tasks", task_id)
+                if is_new:
+                    # If it's a new task, add to the batch
+                    assert len(vessel_df) == expected_df_len
+
+                    vessel_df["trajectory_id"] = task_id
+                    batch.append(vessel_df)
+
+                    # If batch size is met, process and send to Redis
+                    if len(batch) == BATCH_SIZE:
+                        await process_and_send_batch(batch)
+                        batch = []
+                else:
+                    logger.debug(f"Skipping duplicate task for MMSI {mmsi} at timestamp {timestamp}")
+
+                # Remove the first minute of data for the vessel
+                first_timestamp = VESSEL_DATA[name]["timestamp"].min()
+                VESSEL_DATA[name] = VESSEL_DATA[name][
+                    VESSEL_DATA[name]["timestamp"] > first_timestamp + pd.Timedelta(minutes=1)
+                ]
   
         prev_timestamp = curr_timestamp
         await sleep(1)
 
 
-async def get_ais_prediction(trajectory: pd.DataFrame):
+async def process_and_send_batch(batch):
+    # Combine all dataframes in the batch into one
+    assert len(batch) == BATCH_SIZE
+    combined_batch = pd.concat(batch, ignore_index=True)
+
+    # Send the combined batch to the Redis queue
+    redis = app.state.redis
+    await redis.rpush("prediction_queue", combined_batch.to_json())
+
+    logger.debug(f"Sent a batch of {len(batch)} tasks to the prediction queue.")
+
+
+async def get_ais_prediction(batch: pd.DataFrame):
     """
     Sends the AIS data from the prediction queue to the prediction server and receives the predictions.
     """
     async with aiohttp.ClientSession() as session:
-        data = trajectory[["timestamp", "longitude", "latitude"]]
+        data = batch[["mmsi", "timestamp", "longitude", "latitude", "trajectory_id"]]
 
         request_data = {"data": await json_encode_iso(data)}
 
@@ -234,23 +261,17 @@ async def get_ais_prediction(trajectory: pd.DataFrame):
         response = await post_to_server(
             request_data, session, prediction_server_url
         )
-
+        
         if response:
             prediction = pd.DataFrame(response["prediction"])
-
+            prediction["timestamp"] = pd.to_datetime(prediction["timestamp"])
             global PREDICTIONS
-            prediction["mmsi"] = str(trajectory["mmsi"].values[0])
-            prediction["timestamp"] = trajectory["timestamp"].values[1:]
-            prediction["lon"] = trajectory["longitude"].values[1:]
-            prediction["lat"] = trajectory["latitude"].values[1:]
-
-
             if not PREDICTIONS.empty:
                 PREDICTIONS = pd.concat([PREDICTIONS, prediction])
             else:
                 PREDICTIONS = prediction
         else:
-            logger.warning(f"No prediction received for trajectory: {trajectory}")
+            logger.warning(f"No predictions received for batch: {batch}")
 
         await sleep(1)
 
@@ -319,12 +340,18 @@ async def startup():
     asyncio.create_task(ais_state_updater())
     asyncio.create_task(preprocess_ais())
     asyncio.create_task(get_current_CRI_and_clusters_for_vessels())
-    
-    for _ in range(WORKERS):
-        asyncio.create_task(consume_prediction_queue())
+    asyncio.create_task(consume_prediction_queue())
 
+async def shutdown():
+    redis = app.state.redis
+    try:
+        await redis.delete("prediction_queue")
+        logger.info("Deleted prediction queue")
+    except Exception as e:
+        logger.error(f"Error deleting prediction queue: {e}")
 
 app.add_event_handler("startup", startup)
+app.add_event_handler("shutdown", shutdown)
 
 
 async def ais_lat_long_slice_generator(
@@ -386,9 +413,9 @@ async def predictions_generator(mmsi: int | None):
     while True:
         if not PREDICTIONS.empty:
             # If MMSI is provided in query, filter PREDICTIONS for that MMSI, else return all predictions
-            PREDICTIONS.loc[:, "mmsi"] = (
-                PREDICTIONS.loc[:, "mmsi"].astype(float).astype(int)
-            )
+            # PREDICTIONS.loc[:, "mmsi"] = (
+            #     PREDICTIONS.loc[:, "mmsi"].astype(float).astype(int)
+            # )
             data = (
                 PREDICTIONS
                 if mmsi is None
