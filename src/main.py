@@ -175,7 +175,6 @@ async def preprocess_ais():
                 vessel_df["timestamp"].max()
                 - vessel_df["timestamp"].min()
             )
-            logger.debug(f"Time difference for vessel {name}: {diff}")
 
             if diff.total_seconds() >= TRAJECTORY_TIME_THRESHOLD:
                 vessel_df.reset_index(drop=True, inplace=True)
@@ -221,8 +220,6 @@ async def preprocess_ais():
                     if len(batch) == BATCH_SIZE:
                         await process_and_send_batch(batch)
                         batch = []
-                else:
-                    logger.debug(f"Skipping duplicate task for MMSI {mmsi} at timestamp {timestamp}")
 
                 # Remove the first minute of data for the vessel
                 first_timestamp = VESSEL_DATA[name]["timestamp"].min()
