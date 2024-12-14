@@ -44,7 +44,7 @@ app.add_middleware(
 AIS_STATE = {"data": pd.DataFrame(), "last_updated_hour": 0}
 
 PREDICTION_QUEUE = asyncio.Queue()
-TRAJECTORY_TIME_THRESHOLD = 1920 # 32 mins (We need to predict same amount of minutes as we have look ahead points in the model, to calculate predicted speed)
+TRAJECTORY_TIME_THRESHOLD = 60 # 32 mins (We need to predict same amount of minutes as we have look ahead points in the model, to calculate predicted speed)
 
 PREDICTIONS = pd.DataFrame()
 
@@ -61,7 +61,7 @@ async def consume_prediction_queue():
     redis = app.state.redis
     while True:
         # Blocking pop for a task
-        task = await redis.blpop("prediction_queue", timeout=5)
+        task = await redis.blpop("prediction_queue")
         if task:
             _, task_data = task
             batch = pd.read_json(StringIO(task_data.decode("utf-8")))
@@ -102,6 +102,7 @@ async def update_ais_state():
         AIS_STATE["data"] = AIS_STATE["data"].rename(
             columns={"# timestamp": "timestamp"}
         )
+
         logger.info(f"Updated ais state. ({datetime.now().replace(microsecond=0)})")
     except FileNotFoundError:
         logger.error(f"File not found for hour {current_hour}.")
@@ -134,6 +135,9 @@ async def filter_ais_data(data: pd.DataFrame):
     data = data.drop_duplicates(subset=["timestamp", "mmsi"])
     data = data.dropna(subset=["longitude", "latitude", "sog", "cog"])
     data = data.replace([np.inf, -np.inf, np.nan], None)
+
+    data["longitude"] = pd.to_numeric(data["longitude"], errors="coerce")
+    data["latitude"] = pd.to_numeric(data["latitude"], errors="coerce")
 
     data.reset_index(drop=True, inplace=True)
     return data
@@ -177,32 +181,44 @@ async def preprocess_ais():
             )
 
             if diff.total_seconds() >= TRAJECTORY_TIME_THRESHOLD:
-                vessel_df.reset_index(drop=True, inplace=True)
-                vessel_df = vessel_df.infer_objects(copy=False)
-                interp_cols = ["longitude", "latitude"]
-                vessel_df.loc[0, "timestamp"] = vessel_df.loc[0, "timestamp"].floor(
-                    "min"
+
+                # Create start and end time boundaries
+                start_time = vessel_df["timestamp"].min().floor("min")
+                end_time = vessel_df["timestamp"].max()
+
+                # Generate complete range of timestamps at 1-minute intervals
+                complete_range = pd.date_range(
+                    start=start_time, end=end_time, freq="1min"
                 )
                 
-                # max_timestamp = vessel_df["timestamp"].iloc[0] + pd.Timedelta(TRAJECTORY_TIME_THRESHOLD + 60, unit="s")
-                # vessel_df = vessel_df[vessel_df["timestamp"] < max_timestamp]
+                interpolated_df = pd.DataFrame(index=complete_range)
 
-                vessel_df = vessel_df.set_index("timestamp")
-                vessel_df = vessel_df[interp_cols].resample("1min").mean()
-                vessel_df[interp_cols] = vessel_df[interp_cols].interpolate(
-                    method="linear"
+                # Interpolate the longitude and latitude values
+                interpolated_df["longitude"] = np.interp(
+                    interpolated_df.index.astype("int64"),
+                    vessel_df["timestamp"].astype("int64"),
+                    vessel_df["longitude"],
                 )
-                vessel_df = vessel_df.ffill()
-                vessel_df.reset_index(inplace=True)
-                vessel_df["mmsi"] = name
+                interpolated_df["latitude"] = np.interp(
+                    interpolated_df.index.astype("int64"),
+                    vessel_df["timestamp"].astype("int64"),
+                    vessel_df["latitude"],
+                )
+
+                # Add the 'timestamp' as a column instead of index in the interpolated dataframe
+                interpolated_df["timestamp"] = interpolated_df.index
+
+                interpolated_df["mmsi"] = name
+
+                interpolated_df.reset_index(drop=True, inplace=True)
 
                 expected_df_len = (TRAJECTORY_TIME_THRESHOLD / 60) + 1
-                # This is pretty scuffed, but works. Might have to truncate data points before the resampling
-                vessel_df = vessel_df.iloc[:int(expected_df_len)]
+
+                # This is pretty scuffed, but works. Might have to truncate data points before interpolation
+                interpolated_df= interpolated_df.iloc[:int(expected_df_len)]
 
                 # Check if this MMSI and timestamp pair has been processed
-                mmsi = name
-                timestamp = vessel_df["timestamp"].iloc[0]
+                timestamp = interpolated_df["timestamp"].iloc[0]
                 task_id = f"{name}:{timestamp}"
 
                 redis = app.state.redis
@@ -211,10 +227,10 @@ async def preprocess_ais():
                 is_new = await redis.sadd("processed_tasks", task_id)
                 if is_new:
                     # If it's a new task, add to the batch
-                    assert len(vessel_df) == expected_df_len
+                    assert len(interpolated_df) == expected_df_len
 
-                    vessel_df["trajectory_id"] = task_id
-                    batch.append(vessel_df)
+                    interpolated_df["trajectory_id"] = task_id
+                    batch.append(interpolated_df)
 
                     # If batch size is met, process and send to Redis
                     if len(batch) == BATCH_SIZE:
@@ -226,7 +242,7 @@ async def preprocess_ais():
                 VESSEL_DATA[name] = VESSEL_DATA[name][
                     VESSEL_DATA[name]["timestamp"] > first_timestamp + pd.Timedelta(minutes=1)
                 ]
-  
+
         prev_timestamp = curr_timestamp
         await sleep(1)
 
@@ -297,6 +313,7 @@ async def get_current_CRI_and_clusters_for_vessels():
 
 async def post_to_server(data: dict, client_session: aiohttp.ClientSession, url: str):
     try:
+        logger.info(f"Posting data to {url}")
         async with client_session.post(url, json=data) as response:
             if response.status == 200:
                 return await response.json()
