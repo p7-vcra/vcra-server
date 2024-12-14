@@ -43,7 +43,6 @@ app.add_middleware(
 
 AIS_STATE = {"data": pd.DataFrame(), "last_updated_hour": 0}
 
-PREDICTION_QUEUE = asyncio.Queue()
 TRAJECTORY_TIME_THRESHOLD = 60 # 32 mins (We need to predict same amount of minutes as we have look ahead points in the model, to calculate predicted speed)
 
 PREDICTIONS = pd.DataFrame()
@@ -142,6 +141,36 @@ async def filter_ais_data(data: pd.DataFrame):
     data.reset_index(drop=True, inplace=True)
     return data
 
+async def interpolate_ais_data(data: pd.DataFrame) -> pd.DataFrame:
+    # Create start and end time boundaries
+    start_time = data["timestamp"].min().floor("min")
+    end_time = data["timestamp"].max()
+
+    # Generate complete range of timestamps at 1-minute intervals
+    complete_range = pd.date_range(
+        start=start_time, end=end_time, freq="1min"
+    )
+    
+    interpolated_df = pd.DataFrame(index=complete_range)
+
+    # Interpolate the longitude and latitude values
+    interpolated_df["longitude"] = np.interp(
+        interpolated_df.index.astype("int64"),
+        data["timestamp"].astype("int64"),
+        data["longitude"],
+    )
+    interpolated_df["latitude"] = np.interp(
+        interpolated_df.index.astype("int64"),
+        data["timestamp"].astype("int64"),
+        data["latitude"],
+    )
+
+    # Add the 'timestamp' as a column instead of index in the interpolated dataframe
+    interpolated_df["timestamp"] = interpolated_df.index
+
+    interpolated_df.reset_index(drop=True, inplace=True)
+
+    return interpolated_df
 
 async def preprocess_ais():
     """
@@ -182,35 +211,9 @@ async def preprocess_ais():
 
             if diff.total_seconds() >= TRAJECTORY_TIME_THRESHOLD:
 
-                # Create start and end time boundaries
-                start_time = vessel_df["timestamp"].min().floor("min")
-                end_time = vessel_df["timestamp"].max()
-
-                # Generate complete range of timestamps at 1-minute intervals
-                complete_range = pd.date_range(
-                    start=start_time, end=end_time, freq="1min"
-                )
-                
-                interpolated_df = pd.DataFrame(index=complete_range)
-
-                # Interpolate the longitude and latitude values
-                interpolated_df["longitude"] = np.interp(
-                    interpolated_df.index.astype("int64"),
-                    vessel_df["timestamp"].astype("int64"),
-                    vessel_df["longitude"],
-                )
-                interpolated_df["latitude"] = np.interp(
-                    interpolated_df.index.astype("int64"),
-                    vessel_df["timestamp"].astype("int64"),
-                    vessel_df["latitude"],
-                )
-
-                # Add the 'timestamp' as a column instead of index in the interpolated dataframe
-                interpolated_df["timestamp"] = interpolated_df.index
+                interpolated_df = await interpolate_ais_data(vessel_df)
 
                 interpolated_df["mmsi"] = name
-
-                interpolated_df.reset_index(drop=True, inplace=True)
 
                 expected_df_len = (TRAJECTORY_TIME_THRESHOLD / 60) + 1
 
@@ -264,7 +267,7 @@ async def get_ais_prediction(batch: pd.DataFrame):
     Sends the AIS data from the prediction queue to the prediction server and receives the predictions.
     """
     async with aiohttp.ClientSession() as session:
-        data = batch[["mmsi", "timestamp", "longitude", "latitude", "trajectory_id"]]
+        data = batch 
 
         request_data = {"data": await json_encode_iso(data)}
 
@@ -427,9 +430,6 @@ async def predictions_generator(mmsi: int | None):
     while True:
         if not PREDICTIONS.empty:
             # If MMSI is provided in query, filter PREDICTIONS for that MMSI, else return all predictions
-            # PREDICTIONS.loc[:, "mmsi"] = (
-            #     PREDICTIONS.loc[:, "mmsi"].astype(float).astype(int)
-            # )
             data = (
                 PREDICTIONS
                 if mmsi is None
