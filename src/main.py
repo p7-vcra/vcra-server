@@ -43,7 +43,7 @@ app.add_middleware(
 
 AIS_STATE = {"data": pd.DataFrame(), "latest_vessel_states": pd.DataFrame(), "last_updated_hour": 0}
 
-TRAJECTORY_TIME_THRESHOLD = 60 # 32 mins (We need to predict same amount of minutes as we have look ahead points in the model, to calculate predicted speed)
+TRAJECTORY_TIME_THRESHOLD = 1920 # 32 mins (We need to predict same amount of minutes as we have look ahead points in the model, to calculate predicted speed)
 
 PREDICTIONS = pd.DataFrame()
 
