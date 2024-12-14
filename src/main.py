@@ -41,7 +41,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-AIS_STATE = {"data": pd.DataFrame(), "last_updated_hour": 0}
+AIS_STATE = {"data": pd.DataFrame(), "latest_vessel_states": pd.DataFrame(), "last_updated_hour": 0}
 
 TRAJECTORY_TIME_THRESHOLD = 60 # 32 mins (We need to predict same amount of minutes as we have look ahead points in the model, to calculate predicted speed)
 
@@ -108,6 +108,19 @@ async def update_ais_state():
     except Exception as e:
         logger.error(f"Error reading file for hour {current_hour}: {e}")
 
+async def update_latest_vessel_states():
+    """
+    Updates the latest vessel states by taking the last record of each vessel from the AIS data.
+    """
+    if AIS_STATE["data"] is None:
+        return
+
+    current_time = datetime.now().time()
+    data_up_to_now = AIS_STATE["data"][AIS_STATE["data"]["timestamp"].dt.time <= current_time]
+    latest_vessel_states = data_up_to_now.groupby("mmsi").last()
+    AIS_STATE["latest_vessel_states"] = latest_vessel_states
+
+    await sleep(60)
 
 async def ais_state_updater():
     while True:
@@ -119,6 +132,9 @@ async def ais_state_updater():
                 await update_ais_state()
             except Exception as e:
                 logger.error(e)
+
+        await update_latest_vessel_states()
+
         await sleep(1)
 
 
@@ -553,6 +569,10 @@ async def uptime():
     # Time elapsed since server startup
     uptime = str(datetime.now() - app.state.start_time)
     return {"uptime": uptime}   
+
+@app.get("/latest-vessel-states")
+async def latest_vessel_states():
+   return AIS_STATE["latest_vessel_states"].to_json(orient="records", date_format="iso") 
 
 @app.get("/dummy-ais-data")
 async def ais_data_fetch():
