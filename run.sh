@@ -15,5 +15,22 @@ else
     fi
 fi
 
+# Check if Python virtual environment exists
+if [ ! -d "venv" ]; then
+    echo "Python virtual environment not found. Creating a new one..."
+    python -m venv venv
+fi
+
+# Activate the virtual environment
+echo "Activating Python virtual environment..."
+source venv/bin/activate
+
+# Install dependencies using pyproject.toml
+if [ -f "pyproject.toml" ]; then
+    echo "Installing Python dependencies from pyproject.toml..."
+    pip install pip setuptools wheel  # Ensure the environment is ready
+    pip install .
+fi
+
 echo "Starting server..."
 python src/main.py
