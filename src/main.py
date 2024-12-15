@@ -6,6 +6,7 @@ import uvicorn
 import pandas as pd
 import logging
 import aiohttp
+import random
 from fastapi import FastAPI
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -13,6 +14,9 @@ from asyncio import sleep
 from dotenv import load_dotenv
 from datetime import datetime
 from helpers import json_encode_iso, slice_query_validation, format_event
+
+# pandas show all columns
+pd.set_option("display.max_columns", None)
 
 load_dotenv(".env")
 DATA_FILE_PATH = os.getenv("PATH_TO_DATA_FOLDER")
@@ -42,11 +46,12 @@ AIS_STATE = {"data": pd.DataFrame(), "last_updated_hour": 0}
 
 PREDICTION_QUEUE = asyncio.Queue()
 
-TRAJECTORY_TIME_THRESHOLD = 1920  # 32 mins (We need to predict same amount of minutes as we have look ahead points in the model, to calculate predicted speed)
+TRAJECTORY_TIME_THRESHOLD = 1  # 32 mins (We need to predict same amount of minutes as we have look ahead points in the model, to calculate predicted speed)
 
 PREDICTIONS = pd.DataFrame()
 
 CRI_for_vessels = pd.DataFrame()
+Future_CRI_for_vessels = pd.DataFrame()
 
 VESSEL_DATA = {}
 
@@ -143,10 +148,7 @@ async def preprocess_ais():
                 VESSEL_DATA[name] = group
 
             vessel_df: pd.DataFrame = VESSEL_DATA[name]
-            diff = (
-                vessel_df["timestamp"].max()
-                - vessel_df["timestamp"].min()
-            )
+            diff = vessel_df["timestamp"].max() - vessel_df["timestamp"].min()
             logger.debug(f"Time difference for vessel {name}: {diff}")
 
             if diff.total_seconds() >= TRAJECTORY_TIME_THRESHOLD:
@@ -190,12 +192,17 @@ async def preprocess_ais():
                     ["timestamp", "mmsi", "latitude", "longitude"]
                 ]
 
+                if interpolated_df.shape[0] < 32:
+                    interpolated_df = pd.concat(
+                        [interpolated_df] * 32, ignore_index=True
+                    )
+
                 # Add the interpolated data to the prediction queue
                 await PREDICTION_QUEUE.put(interpolated_df)
 
                 # Clear vessel data for mmsi
                 VESSEL_DATA[name] = vessel_df.iloc[1:]
-  
+
         prev_timestamp = curr_timestamp
         await sleep(1)
 
@@ -228,6 +235,7 @@ async def get_ais_prediction():
                 prediction = pd.DataFrame(response["prediction"])
 
                 global PREDICTIONS
+                # set prediction MMSi to either be 10000000 or 20000000
                 prediction["mmsi"] = mmsi
                 prediction["timestamp"] = trajectory["timestamp"].values[1:]
                 prediction["lon"] = trajectory["longitude"].values[1:]
@@ -262,6 +270,97 @@ async def get_current_CRI_and_clusters_for_vessels():
                         logger.warning(f"Failed to get CRI and clusters: {response}")
             except aiohttp.ClientError as e:
                 logger.error(f"Network error while getting CRI and clusters: {e}")
+            await sleep(5)
+
+
+async def get_future_CRI_for_vessels():
+    """
+    Fetch future Collision Risk Index (CRI) for vessels in `CRI_for_vessels` dataframe.
+    Only vessel pairs where both have predictions are sent in the request.
+    """
+    global Future_CRI_for_vessels
+
+    async with aiohttp.ClientSession() as session:
+        while True:
+            if PREDICTIONS.empty or CRI_for_vessels.empty:
+                await sleep(5)
+                continue
+
+            # Filter CRI_for_vessels to include only pairs where both vessels have predictions
+            valid_pairs = CRI_for_vessels[
+                CRI_for_vessels.apply(
+                    lambda row: row["vessel_1"] in PREDICTIONS["mmsi"].values
+                    and row["vessel_2"] in PREDICTIONS["mmsi"].values,
+                    axis=1,
+                )
+            ]
+
+            if valid_pairs.empty:
+                await sleep(5)
+                continue
+
+            # Prepare request data
+            request_data = {
+                "pairs": valid_pairs.to_dict(orient="records"),
+                "predictions": PREDICTIONS.to_dict(orient="records"),
+            }
+            # Prepare the JSON object with the required data
+            future_cri_data = []
+
+            for _, row in valid_pairs.iterrows():
+                vessel_1_predictions = PREDICTIONS[
+                    PREDICTIONS["mmsi"] == row["vessel_1"]
+                ]
+                vessel_2_predictions = PREDICTIONS[
+                    PREDICTIONS["mmsi"] == row["vessel_2"]
+                ]
+
+                if not vessel_1_predictions.empty and not vessel_2_predictions.empty:
+                    future_cri_data.append(
+                        {
+                            "vessel_1": row["vessel_1"],
+                            "vessel_2": row["vessel_2"],
+                            "vessel_1_speed": vessel_1_predictions[
+                                "speed(t+32)"
+                            ].tolist()[-1],
+                            "vessel_2_speed": vessel_2_predictions[
+                                "speed(t+32)"
+                            ].tolist()[-1],
+                            "vessel_1_longitude": vessel_1_predictions["lon"].tolist()[
+                                -1
+                            ],
+                            "vessel_2_longitude": vessel_2_predictions["lon"].tolist()[
+                                -1
+                            ],
+                            "vessel_1_latitude": vessel_1_predictions["lat"].tolist()[
+                                -1
+                            ],
+                            "vessel_2_latitude": vessel_2_predictions["lat"].tolist()[
+                                -1
+                            ],
+                            "vessel_1_course": row["vessel_1_course"],
+                            "vessel_2_course": row["vessel_2_course"],
+                        }
+                    )
+
+            request_data = {"future_cri_data": future_cri_data}
+            future_cri_server_url = (
+                f"http://localhost:{CRI_SERVER_PORT}/clusters/future"
+            )
+
+            try:
+                response = await post_to_server(
+                    request_data, session, future_cri_server_url
+                )
+
+                if response:
+                    global Future_CRI_for_vessels
+                    Future_CRI_for_vessels = pd.DataFrame(response["future_cri"])
+                else:
+                    logger.warning("No future CRI received for any pairs.")
+            except Exception as e:
+                logger.error(f"Error fetching future CRI: {e}")
+
             await sleep(5)
 
 
@@ -308,6 +407,7 @@ async def startup():
     asyncio.create_task(preprocess_ais())
     asyncio.create_task(get_ais_prediction())
     asyncio.create_task(get_current_CRI_and_clusters_for_vessels())
+    asyncio.create_task(get_future_CRI_for_vessels())
 
 
 app.add_event_handler("startup", startup)
@@ -453,6 +553,28 @@ async def CRI_generator():
         await sleep(10)
 
 
+async def Future_CRI_generator():
+    """
+    Asynchronous generator that yields CRI data for all vessels.
+
+    Yields:
+        str: A formatted event string containing CRI data in JSON format.
+
+    Notes:
+        - The function continuously checks for new CRI data every 10 seconds.
+        - If the CRI DataFrame is empty, an empty JSON array is returned.
+        - The CRI data includes mmsi, cluster, and CRI columns.
+    """
+    while True:
+        if not Future_CRI_for_vessels.empty:
+            data = await json_encode_iso(Future_CRI_for_vessels)
+        else:
+            data = []
+
+        yield format_event("future_cri", data)
+        await sleep(10)
+
+
 async def sse_data_generator(
     mmsi: int | None, latitude_range: tuple | None, longitude_range: tuple | None
 ):
@@ -464,16 +586,23 @@ async def sse_data_generator(
 
     predictions_gen = predictions_generator(mmsi)
     CRI_gen = CRI_generator()
+    Future_CRI_gen = Future_CRI_generator()
 
     # Track the next events for each generator
     next_ais_event = asyncio.create_task(ais_gen.__anext__())
     next_predictions_event = asyncio.create_task(predictions_gen.__anext__())
     next_cri_event = asyncio.create_task(CRI_gen.__anext__())
+    next_future_cri_event = asyncio.create_task(Future_CRI_gen.__anext__())
 
     while True:
         # Wait for any generator to produce an event
         done, _ = await asyncio.wait(
-            [next_ais_event, next_predictions_event, next_cri_event],
+            [
+                next_ais_event,
+                next_predictions_event,
+                next_cri_event,
+                next_future_cri_event,
+            ],
             return_when=asyncio.FIRST_COMPLETED,
         )
 
@@ -489,6 +618,8 @@ async def sse_data_generator(
                 )
             elif task == next_cri_event:
                 next_cri_event = asyncio.create_task(CRI_gen.__anext__())
+            elif task == next_future_cri_event:
+                next_future_cri_event = asyncio.create_task(Future_CRI_gen.__anext__())
 
 
 async def get_current_ais_data():
@@ -498,11 +629,13 @@ async def get_current_ais_data():
 
     return result, current_time
 
+
 @app.get("/uptime")
 async def uptime():
     # Time elapsed since server startup
     uptime = str(datetime.now() - app.state.start_time)
-    return {"uptime": uptime}   
+    return {"uptime": uptime}
+
 
 @app.get("/dummy-ais-data")
 async def ais_data_fetch():
@@ -519,6 +652,12 @@ async def dummy_prediction_fetch():
 @app.get("/dummy-CRI")
 async def dummy_CRI_fetch():
     generator = CRI_generator()
+    return StreamingResponse(generator, media_type="text/event-stream")
+
+
+@app.get("/dummy-future-CRI")
+async def dummy_CRI_fetch():
+    generator = Future_CRI_generator()
     return StreamingResponse(generator, media_type="text/event-stream")
 
 
