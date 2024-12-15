@@ -43,9 +43,7 @@ jobs:
 
           # Start a new screen session and deploy the app
           screen -dmS "${SCREEN_SESSION_NAME}"
-          screen -S "${SCREEN_SESSION_NAME}" -X stuff 'source ${{ secrets.ENV_PATH }}\n'
-          screen -S "${SCREEN_SESSION_NAME}" -X stuff 'pip install .\n'
-          screen -S "${SCREEN_SESSION_NAME}" -X stuff 'python ${{ secrets.START_SCRIPT_PATH }}\n'
+          screen -S "${SCREEN_SESSION_NAME}" -X stuff './run.sh\n'
 
           # List screen sessions for verification
           screen -ls
