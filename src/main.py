@@ -473,6 +473,13 @@ async def get_ais_cri():
 async def startup():
     app.state.start_time = datetime.now()
     app.state.redis = await get_redis_connection()
+    
+    try:
+        await app.state.redis.delete("prediction_queue")
+        logger.info("Deleted prediction queue")
+    except Exception as e:
+        logger.error(f"Error deleting prediction queue: {e}")
+        
     asyncio.create_task(ais_state_updater())
     asyncio.create_task(preprocess_ais())
     asyncio.create_task(get_current_CRI_and_clusters_for_vessels())
@@ -480,17 +487,7 @@ async def startup():
     asyncio.create_task(consume_prediction_queue())
 
 
-async def shutdown():
-    redis = app.state.redis
-    try:
-        await redis.delete("prediction_queue")
-        logger.info("Deleted prediction queue")
-    except Exception as e:
-        logger.error(f"Error deleting prediction queue: {e}")
-
-
 app.add_event_handler("startup", startup)
-app.add_event_handler("shutdown", shutdown)
 
 
 async def ais_lat_long_slice_generator(
