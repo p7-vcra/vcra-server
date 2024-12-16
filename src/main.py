@@ -89,7 +89,7 @@ async def consume_prediction_queue():
                 logger.debug(f"Removed task {task_id} from processed tasks set")
 
             size = await redis.llen("prediction_queue")
-            logger.debug(f"Queued tasks set size: {size}")
+            logger.info(f"Queued tasks set size: {size}")
         await asyncio.sleep(1)
 
 
