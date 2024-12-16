@@ -132,7 +132,7 @@ async def update_latest_vessel_states():
     data_up_to_now = AIS_STATE["data"][
         AIS_STATE["data"]["timestamp"].dt.time <= current_time
     ]
-    latest_vessel_states = data_up_to_now.groupby("mmsi").last()
+    latest_vessel_states = data_up_to_now.groupby("mmsi").last().reset_index()
     AIS_STATE["latest_vessel_states"] = latest_vessel_states
 
     await sleep(60)
