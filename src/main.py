@@ -414,7 +414,7 @@ async def get_future_CRI_for_vessels():
 
             request_data = {"future_cri_data": future_cri_data}
             future_cri_server_url = (
-                f"http://localhost:{CRI_SERVER_PORT}/clusters/future"
+                f"http://{CRI_SERVER_IP}:{CRI_SERVER_PORT}/clusters/future"
             )
 
             try:
