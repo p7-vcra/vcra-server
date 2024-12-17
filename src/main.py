@@ -26,9 +26,9 @@ WORKERS = int(os.getenv("WORKERS", "1"))
 SOURCE_IP = os.getenv("SOURCE_IP", "0.0.0.0")
 SOURCE_PORT = int(os.getenv("SOURCE_PORT", "8000"))
 PREDICTION_SERVER_IP = os.getenv("PREDICTION_SERVER_IP", "0.0.0.0")
-PREDICTION_SERVER_PORT = os.getenv("PREDICTION_SERVER_PORT", "8001")
+PREDICTION_SERVER_PORT = int(os.getenv("PREDICTION_SERVER_PORT", "8001"))
 CRI_SERVER_IP = os.getenv("CRI_SERVER_IP", "0.0.0.0")
-CRI_SERVER_PORT = os.getenv("CRI_SERVER_PORT", "8002")
+CRI_SERVER_PORT = int(os.getenv("CRI_SERVER_PORT", "8002"))
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 TRAJECTORY_TIME_THRESHOLD = int(os.getenv("TRAJECTORY_TIME_THRESHOLD", 1920))
 
@@ -40,6 +40,7 @@ AIS_STATE = {
     "data": pd.DataFrame(),
     "latest_vessel_states": pd.DataFrame(),
     "last_updated_hour": 0,
+    "trajectory_predictions": pd.DataFrame(),
 }
 
 
@@ -66,7 +67,7 @@ async def consume_prediction_queue():
             _, task_data = task
             batch = pd.read_json(StringIO(task_data.decode("utf-8")))
 
-            await get_ais_prediction(batch)
+            await get_ais_prediction(batch, redis)
             # After processing, remove each task (mmsi:timestamp) from the Redis set
             for mmsi, vessel in batch.groupby(
                 "mmsi"
@@ -128,6 +129,16 @@ async def update_latest_vessel_states():
 
     await sleep(60)
 
+async def update_trajectory_predictions():
+    redis = app.state.redis
+    pred = await redis.get("predictions")
+    if pred:
+        AIS_STATE["trajectory_predictions"] = pd.read_json(StringIO(pred.decode("utf-8")))
+    else:
+        logger.warning("No predictions found in Redis.")
+    
+    await sleep(10)
+    
 
 async def ais_state_updater():
     while True:
@@ -142,8 +153,22 @@ async def ais_state_updater():
 
         await update_latest_vessel_states()
 
+        await update_trajectory_predictions()
+
         await sleep(1)
 
+async def consumer_state_updater():
+    while True:
+        if (
+            AIS_STATE["last_updated_hour"] != datetime.now().hour
+            or AIS_STATE["data"] is None
+        ):
+            try:
+                await update_ais_state()
+            except Exception as e:
+                logger.error(e)
+    
+        await sleep(1)
 
 async def filter_ais_data(data: pd.DataFrame):
     """
@@ -283,7 +308,7 @@ async def process_and_send_batch(batch):
     logger.debug(f"Sent a batch of {len(batch)} tasks to the prediction queue.")
 
 
-async def get_ais_prediction(batch: pd.DataFrame):
+async def get_ais_prediction(batch: pd.DataFrame, redis):
     """
     Sends the AIS data from the prediction queue to the prediction server and receives the predictions.
     """
@@ -305,6 +330,8 @@ async def get_ais_prediction(batch: pd.DataFrame):
                 PREDICTIONS = pd.concat([PREDICTIONS, prediction])
             else:
                 PREDICTIONS = prediction
+
+            await redis.set("predictions", PREDICTIONS.to_json(orient="records"))
         else:
             logger.warning(f"No predictions received for batch: {batch}")
 
@@ -342,15 +369,16 @@ async def get_future_CRI_for_vessels():
 
     async with aiohttp.ClientSession() as session:
         while True:
-            if PREDICTIONS.empty or CRI_for_vessels.empty:
+            predictions = AIS_STATE["trajectory_predictions"]
+            if predictions.empty or CRI_for_vessels.empty:
                 await sleep(5)
                 continue
 
             # Filter CRI_for_vessels to include only pairs where both vessels have predictions
             valid_pairs = CRI_for_vessels[
                 CRI_for_vessels.apply(
-                    lambda row: row["vessel_1"] in PREDICTIONS["mmsi"].values
-                    and row["vessel_2"] in PREDICTIONS["mmsi"].values,
+                    lambda row: row["vessel_1"] in predictions["mmsi"].values
+                    and row["vessel_2"] in predictions["mmsi"].values,
                     axis=1,
                 )
             ]
@@ -362,17 +390,17 @@ async def get_future_CRI_for_vessels():
             # Prepare request data
             request_data = {
                 "pairs": valid_pairs.to_dict(orient="records"),
-                "predictions": PREDICTIONS.to_dict(orient="records"),
+                "predictions": predictions.to_dict(orient="records"),
             }
             # Prepare the JSON object with the required data
             future_cri_data = []
 
             for _, row in valid_pairs.iterrows():
-                vessel_1_predictions = PREDICTIONS[
-                    PREDICTIONS["mmsi"] == row["vessel_1"]
+                vessel_1_predictions = predictions[
+                    predictions["mmsi"] == row["vessel_1"]
                 ]
-                vessel_2_predictions = PREDICTIONS[
-                    PREDICTIONS["mmsi"] == row["vessel_2"]
+                vessel_2_predictions = predictions[
+                    predictions["mmsi"] == row["vessel_2"]
                 ]
 
                 if not vessel_1_predictions.empty and not vessel_2_predictions.empty:
@@ -440,11 +468,12 @@ async def post_to_server(data: dict, client_session: aiohttp.ClientSession, url:
 async def get_ais_cri():
     async with aiohttp.ClientSession() as session:
         while True:
-            if PREDICTIONS.empty:
+            predictions = AIS_STATE["trajectory_predictions"]
+            if predictions.empty:
                 await sleep(1)
                 continue
 
-            data = PREDICTIONS[["timestamp", "mmsi", "lon", "lat"]]
+            data = predictions[["timestamp", "mmsi", "lon", "lat"]]
             data = await json_encode_iso(data)
             request_data = {"data": data}
 
@@ -459,8 +488,6 @@ async def get_ais_cri():
                 logger.warning(f"No CRI received for data: {data}")
 
             await sleep(1)
-
-
 
 
 async def ais_lat_long_slice_generator(
@@ -520,12 +547,13 @@ async def predictions_generator(mmsi: int | None):
         f"lat(t+{i})" for i in range(1, 33)
     ]
     while True:
-        if not PREDICTIONS.empty:
+        predictions = AIS_STATE["trajectory_predictions"]
+        if not predictions.empty:
             # If MMSI is provided in query, filter PREDICTIONS for that MMSI, else return all predictions
             data = (
-                PREDICTIONS
+                predictions
                 if mmsi is None
-                else PREDICTIONS[PREDICTIONS["mmsi"] == mmsi]
+                else predictions[predictions["mmsi"] == mmsi]
             )
 
             # Tranform predicted columns into rows for each timestamp
@@ -698,9 +726,14 @@ async def app_startup():
     asyncio.create_task(get_future_CRI_for_vessels())
     # asyncio.create_task(consume_prediction_queue())
 
+@app.get("/ais-state")
+async def get_ais_state():
+    return AIS_STATE["data"].to_json(orient="records", date_format="iso")
+
 async def consume_app_startup():
     consume_app.state.redis = await get_redis_connection()
     asyncio.create_task(consume_prediction_queue())
+    asyncio.create_task(consumer_state_updater())
 
 app.add_event_handler("startup", app_startup)
 consume_app.add_event_handler("startup", consume_app_startup)
