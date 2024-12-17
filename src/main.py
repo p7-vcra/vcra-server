@@ -273,7 +273,7 @@ async def preprocess_ais():
                 first_timestamp = VESSEL_DATA[name]["timestamp"].min()
                 VESSEL_DATA[name] = VESSEL_DATA[name][
                     VESSEL_DATA[name]["timestamp"]
-                    > first_timestamp + pd.Timedelta(minutes=1)
+                    > first_timestamp + pd.Timedelta(minutes=2)
                 ]
 
         prev_timestamp = curr_timestamp
