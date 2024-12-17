@@ -15,6 +15,7 @@ from asyncio import sleep
 from dotenv import load_dotenv
 from datetime import datetime
 from helpers import json_encode_iso, slice_query_validation, format_event
+from multiprocessing import Process
 
 # pandas show all columns
 pd.set_option("display.max_columns", None)
@@ -34,15 +35,6 @@ logger = logging.getLogger("uvicorn.error")
 
 LOG_LEVEL = logging.INFO
 
-app = FastAPI(debug=True)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 AIS_STATE = {
     "data": pd.DataFrame(),
@@ -50,7 +42,7 @@ AIS_STATE = {
     "last_updated_hour": 0,
 }
 
-TRAJECTORY_TIME_THRESHOLD = 1920  # 32 mins (We need to predict same amount of minutes as we have look ahead points in the model, to calculate predicted speed)
+TRAJECTORY_TIME_THRESHOLD = 60 # 32 mins (We need to predict same amount of minutes as we have look ahead points in the model, to calculate predicted speed)
 
 PREDICTIONS = pd.DataFrame()
 
@@ -67,7 +59,7 @@ async def get_redis_connection():
 
 
 async def consume_prediction_queue():
-    redis = app.state.redis
+    redis = consume_app.state.redis
     while True:
         # Blocking pop for a task
         task = await redis.blpop("prediction_queue")
@@ -470,24 +462,6 @@ async def get_ais_cri():
             await sleep(1)
 
 
-async def startup():
-    app.state.start_time = datetime.now()
-    app.state.redis = await get_redis_connection()
-    
-    try:
-        await app.state.redis.delete("prediction_queue")
-        logger.info("Deleted prediction queue")
-    except Exception as e:
-        logger.error(f"Error deleting prediction queue: {e}")
-        
-    asyncio.create_task(ais_state_updater())
-    asyncio.create_task(preprocess_ais())
-    asyncio.create_task(get_current_CRI_and_clusters_for_vessels())
-    asyncio.create_task(get_future_CRI_for_vessels())
-    asyncio.create_task(consume_prediction_queue())
-
-
-app.add_event_handler("startup", startup)
 
 
 async def ais_lat_long_slice_generator(
@@ -698,6 +672,48 @@ async def get_current_ais_data():
 
     return result, current_time
 
+app = FastAPI(debug=True)
+consume_app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+async def app_startup():
+    app.state.start_time = datetime.now()
+    app.state.redis = await get_redis_connection()
+    
+    try:
+        await app.state.redis.delete("prediction_queue")
+        logger.info("Deleted prediction queue")
+    except Exception as e:
+        logger.error(f"Error deleting prediction queue: {e}")
+        
+    asyncio.create_task(ais_state_updater())
+    asyncio.create_task(preprocess_ais())
+    asyncio.create_task(get_current_CRI_and_clusters_for_vessels())
+    asyncio.create_task(get_future_CRI_for_vessels())
+    # asyncio.create_task(consume_prediction_queue())
+
+async def consume_app_startup():
+    consume_app.state.redis = await get_redis_connection()
+    asyncio.create_task(consume_prediction_queue())
+
+app.add_event_handler("startup", app_startup)
+consume_app.add_event_handler("startup", consume_app_startup)
+
+def run_consume_app():
+    uvicorn.run(
+        "main:consume_app",
+        host=SOURCE_IP,
+        port=SOURCE_PORT + 1,  # Use a different port for the worker
+        log_level=LOG_LEVEL,
+        workers=WORKERS,
+    )
 
 @app.get("/uptime")
 async def uptime():
@@ -791,10 +807,16 @@ if __name__ == "__main__":
     if args.debug:
         LOG_LEVEL = logging.DEBUG
 
+    # Run the consume app in a separate process
+    consume_process = Process(target=run_consume_app)
+    consume_process.start()
+
     uvicorn.run(
         "main:app",
         host=SOURCE_IP,
         port=SOURCE_PORT,
         log_level=LOG_LEVEL,
-        workers=WORKERS,
+        workers=4,
     )
+
+    consume_process.join()
