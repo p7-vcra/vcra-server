@@ -441,7 +441,7 @@ async def post_to_server(data: dict, client_session: aiohttp.ClientSession, url:
                 return await response.json()
             else:
                 logger.warning(f"Failed to post data to {url}: {response}")
-    except aiohttp.ClientError as e:
+    except Exception as e:
         logger.error(f"Network error while posting to {url}: {e}")
         return None
 
