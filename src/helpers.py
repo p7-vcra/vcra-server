@@ -1,3 +1,6 @@
+from asyncio.log import logger
+import aiohttp
+import aioredis
 from fastapi import HTTPException
 import pandas as pd
 
@@ -69,3 +72,18 @@ async def json_encode_iso(data: pd.DataFrame):
 
 def format_event(event: str, data: str) -> str:
     return f"event: {event}\ndata: {data}\n\n"
+
+async def get_redis_connection(url: str):
+    return await aioredis.from_url(url)
+
+async def post_to_server(data: dict, client_session: aiohttp.ClientSession, url: str):
+    try:
+        logger.info(f"Posting data to {url}")
+        async with client_session.post(url, json=data) as response:
+            if response.status == 200:
+                return await response.json()
+            else:
+                logger.warning(f"Failed to post data to {url}: {response}")
+    except aiohttp.ClientError as e:
+        logger.error(f"Network error while posting to {url}: {e}")
+        return None

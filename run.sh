@@ -33,4 +33,6 @@ if [ -f "pyproject.toml" ]; then
 fi
 
 echo "Starting server..."
-python src/main.py
+python src/server.py
+python src/ais_state.py
+python src/traj_predictions.py
