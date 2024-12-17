@@ -30,11 +30,11 @@ PREDICTION_SERVER_PORT = os.getenv("PREDICTION_SERVER_PORT", "8001")
 CRI_SERVER_IP = os.getenv("CRI_SERVER_IP", "0.0.0.0")
 CRI_SERVER_PORT = os.getenv("CRI_SERVER_PORT", "8002")
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
+TRAJECTORY_TIME_THRESHOLD = int(os.getenv("TRAJECTORY_TIME_THRESHOLD", 1920))
 
 logger = logging.getLogger("uvicorn.error")
 
 LOG_LEVEL = logging.INFO
-
 
 AIS_STATE = {
     "data": pd.DataFrame(),
@@ -42,7 +42,6 @@ AIS_STATE = {
     "last_updated_hour": 0,
 }
 
-TRAJECTORY_TIME_THRESHOLD = 60 # 32 mins (We need to predict same amount of minutes as we have look ahead points in the model, to calculate predicted speed)
 
 PREDICTIONS = pd.DataFrame()
 
