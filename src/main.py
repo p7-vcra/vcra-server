@@ -375,11 +375,7 @@ async def get_future_CRI_for_vessels():
     async with aiohttp.ClientSession() as session:
         while True:
             predictions = AIS_STATE["trajectory_predictions"]
-            if (
-                predictions.empty
-                or CRI_for_vessels.empty
-                or "speed(t+32)" not in predictions.columns
-            ):
+            if predictions.empty or CRI_for_vessels.empty:
                 await sleep(5)
                 continue
 
