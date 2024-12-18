@@ -129,16 +129,19 @@ async def update_latest_vessel_states():
 
     await sleep(60)
 
+
 async def update_trajectory_predictions():
     redis = app.state.redis
     pred = await redis.get("predictions")
     if pred:
-        AIS_STATE["trajectory_predictions"] = pd.read_json(StringIO(pred.decode("utf-8")))
+        AIS_STATE["trajectory_predictions"] = pd.read_json(
+            StringIO(pred.decode("utf-8"))
+        )
     else:
         logger.warning("No predictions found in Redis.")
-    
+
     await sleep(10)
-    
+
 
 async def ais_state_updater():
     while True:
@@ -157,6 +160,7 @@ async def ais_state_updater():
 
         await sleep(1)
 
+
 async def consumer_state_updater():
     while True:
         if (
@@ -167,8 +171,9 @@ async def consumer_state_updater():
                 await update_ais_state()
             except Exception as e:
                 logger.error(e)
-    
+
         await sleep(1)
+
 
 async def filter_ais_data(data: pd.DataFrame):
     """
@@ -370,7 +375,11 @@ async def get_future_CRI_for_vessels():
     async with aiohttp.ClientSession() as session:
         while True:
             predictions = AIS_STATE["trajectory_predictions"]
-            if predictions.empty or CRI_for_vessels.empty or 'speed(t+32)' not in predictions.columns:
+            if (
+                predictions.empty
+                or CRI_for_vessels.empty
+                or "speed(t+32)" not in predictions.columns
+            ):
                 await sleep(5)
                 continue
 
@@ -408,12 +417,8 @@ async def get_future_CRI_for_vessels():
                         {
                             "vessel_1": row["vessel_1"],
                             "vessel_2": row["vessel_2"],
-                            "vessel_1_speed": vessel_1_predictions[
-                                "speed(t+32)"
-                            ].tolist()[-1],
-                            "vessel_2_speed": vessel_2_predictions[
-                                "speed(t+32)"
-                            ].tolist()[-1],
+                            "vessel_1_speed": row["vessel_1_speed"],
+                            "vessel_2_speed": row["vessel_2_speed"],
                             "vessel_1_longitude": vessel_1_predictions["lon"].tolist()[
                                 -1
                             ],
@@ -699,6 +704,7 @@ async def get_current_ais_data():
 
     return result, current_time
 
+
 app = FastAPI(debug=True)
 consume_app = FastAPI()
 
@@ -710,33 +716,38 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
 async def app_startup():
     app.state.start_time = datetime.now()
     app.state.redis = await get_redis_connection()
-    
+
     try:
         await app.state.redis.delete("prediction_queue")
         logger.info("Deleted prediction queue")
     except Exception as e:
         logger.error(f"Error deleting prediction queue: {e}")
-        
+
     asyncio.create_task(ais_state_updater())
     asyncio.create_task(preprocess_ais())
     asyncio.create_task(get_current_CRI_and_clusters_for_vessels())
     asyncio.create_task(get_future_CRI_for_vessels())
     # asyncio.create_task(consume_prediction_queue())
 
+
 @app.get("/ais-state")
 async def get_ais_state():
     return AIS_STATE["data"].to_json(orient="records", date_format="iso")
+
 
 async def consume_app_startup():
     consume_app.state.redis = await get_redis_connection()
     asyncio.create_task(consume_prediction_queue())
     asyncio.create_task(consumer_state_updater())
 
+
 app.add_event_handler("startup", app_startup)
 consume_app.add_event_handler("startup", consume_app_startup)
+
 
 def run_consume_app():
     uvicorn.run(
@@ -746,6 +757,7 @@ def run_consume_app():
         log_level=LOG_LEVEL,
         workers=WORKERS,
     )
+
 
 @app.get("/uptime")
 async def uptime():
@@ -848,7 +860,7 @@ if __name__ == "__main__":
         host=SOURCE_IP,
         port=SOURCE_PORT,
         log_level=LOG_LEVEL,
-        workers=4,
+        workers=WORKERS,
     )
 
     consume_process.join()
