@@ -182,7 +182,7 @@ async def filter_ais_data(data: pd.DataFrame):
 
     data = data[(data["mmsi"] >= 201000000) & (data["mmsi"] <= 775999999)]
     data = data.loc[data["navigational status"] != "Moored"]
-    data = data.loc[data["sog"] != 0]
+    data = data.loc[data["sog"] >= 1]
     data = data.loc[data["sog"] <= 50]
     data = data.drop_duplicates(subset=["timestamp", "mmsi"])
     data = data.dropna(subset=["longitude", "latitude", "sog", "cog"])
